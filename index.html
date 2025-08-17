@@ -150,19 +150,68 @@ function initPDFExplorer() {
     document.getElementById('outputContainer').innerHTML = '';
   }
 
-  function extractTopLevelDict(bodyStr) {
-    const start = bodyStr.indexOf('<<');
-    if (start === -1) return '';
-    let nest = 1;
-    for (let i = start + 2; i < bodyStr.length - 1; i++) {
-      if (bodyStr[i] === '<' && bodyStr[i+1] === '<') { nest++; i++; }
-      else if (bodyStr[i] === '>' && bodyStr[i+1] === '>') {
-        nest--; i++;
-        if (nest === 0) return bodyStr.substring(start, i + 1);
-      }
-    }
-    return bodyStr.substring(start);
+function extractTopLevelDict(bodyStr) {
+  // Normalize malformed brackets and extra closing brackets
+  let normalizedStr = bodyStr
+    .replace(/<\s*(\d+\s+\d+\s+R\s*)>>>/g, '<< $1 >>') // Fix < 4 0 R>>> to << 4 0 R >>
+    .replace(/<\s*(\d+\s+\d+\s+R\s*)>>>>/g, '<< $1 >>') // Fix < 4 0 R>>>> to << 4 0 R >>
+    .replace(/<\s*(\[.*?\]\s*)>>/g, '<< $1 >>') // Fix <[2 0 R]>> to << [2 0 R] >>
+    .replace(/\/Font\s*<\s*(\d+\s+\d+\s+R\s*)>>>>/g, '/Font << /F1 $1 >>'); // Fix /Font < 4 0 R>>>> to /Font << /F1 4 0 R >>
+
+  const start = normalizedStr.indexOf('<<');
+  if (start === -1) {
+    debugInfo.push(`[extractTopLevelDict] No valid dictionary found in: ${bodyStr}`);
+    return normalizedStr; // Return normalized raw content as fallback
   }
+
+  let nest = 0;
+  let inLiteralString = false;
+  let inHexString = false;
+  let parenNest = 0;
+
+  for (let i = start; i < normalizedStr.length; i++) {
+    const char = normalizedStr[i];
+    const nextChar = (i + 1 < normalizedStr.length) ? normalizedStr[i + 1] : null;
+
+    if (inLiteralString) {
+      if (char === '\\') { i++; continue; }
+      if (char === '(') { parenNest++; }
+      else if (char === ')') {
+        if (parenNest > 0) parenNest--;
+        else inLiteralString = false;
+      }
+      continue;
+    }
+
+    if (inHexString) {
+      if (char === '>') inHexString = false;
+      continue;
+    }
+
+    if (char === '<') {
+      if (nextChar === '<') {
+        nest++;
+        i++;
+      } else {
+        inHexString = true;
+      }
+    } else if (char === '>') {
+      if (nextChar === '>') {
+        nest--;
+        i++;
+        if (nest === 0) {
+          return normalizedStr.substring(start, i + 1);
+        }
+      }
+    } else if (char === '(') {
+      inLiteralString = true;
+      parenNest = 0;
+    }
+  }
+
+  debugInfo.push(`[extractTopLevelDict] Unclosed dictionary in: ${bodyStr}`);
+  return normalizedStr.substring(start); // Return partial dictionary if unclosed
+}
 
   function store(num, gen, body) {
     const key = `${num} ${gen}`;
@@ -185,24 +234,62 @@ function initPDFExplorer() {
 
   function extractDictAndStreamBoundsRough(objectBytes, globalStartOffset) {
     if (!objectBytes || objectBytes.length === 0) return { dictStr: null, streamStartOffset: -1, streamEndOffset: -1 };
+
     let dictStart = -1;
     for (let i = 0; i < objectBytes.length - 1; i++) {
       if (objectBytes[i] === 60 && objectBytes[i + 1] === 60) { dictStart = i; break; }
     }
     if (dictStart === -1) return { dictStr: null, streamStartOffset: -1, streamEndOffset: -1 };
+
     let dictEnd = -1;
     let nestingLevel = 0;
-    for (let i = dictStart + 2; i < objectBytes.length - 1; i++) {
-      if (objectBytes[i] === 60 && objectBytes[i + 1] === 60) { nestingLevel++; i++; }
-      else if (objectBytes[i] === 62 && objectBytes[i + 1] === 62) {
-        if (nestingLevel === 0) { dictEnd = i + 2; break; }
-        else { nestingLevel--; i++; }
-      }
+    let inLiteralString = false;
+    let inHexString = false;
+    let parenNesting = 0;
+
+    for (let i = dictStart; i < objectBytes.length; i++) {
+        const b = objectBytes[i];
+        if (inLiteralString) {
+            if (b === 92) { i++; continue; }
+            if (b === 40) { parenNesting++; }
+            else if (b === 41) {
+                if (parenNesting > 0) parenNesting--;
+                else inLiteralString = false;
+            }
+            continue;
+        }
+        if (inHexString) {
+            if (b === 62) inHexString = false;
+            continue;
+        }
+        if (b === 60) {
+            if (i + 1 < objectBytes.length && objectBytes[i+1] === 60) {
+                nestingLevel++;
+                i++;
+            } else {
+                inHexString = true;
+            }
+        } else if (b === 62) {
+            if (i + 1 < objectBytes.length && objectBytes[i+1] === 62) {
+                nestingLevel--;
+                i++;
+                if (nestingLevel === 0) {
+                    dictEnd = i + 1;
+                    break;
+                }
+            }
+        } else if (b === 40) {
+            inLiteralString = true;
+            parenNesting = 0;
+        }
     }
+
     if (dictEnd === -1) return { dictStr: null, streamStartOffset: -1, streamEndOffset: -1 };
+
     const dictStr = new TextDecoder('latin1').decode(objectBytes.slice(dictStart, dictEnd));
     const streamKeywordOffsetRel = findKeywordBytes(objectBytes, STREAM_BYTES, dictEnd);
     if (streamKeywordOffsetRel === -1) return { dictStr, streamStartOffset: -1, streamEndOffset: -1 };
+
     let streamStartOffsetRel = streamKeywordOffsetRel + STREAM_BYTES.length;
     while (streamStartOffsetRel < objectBytes.length) {
       const byte = objectBytes[streamStartOffsetRel];
@@ -210,8 +297,10 @@ function initPDFExplorer() {
       else break;
     }
     if (streamStartOffsetRel >= objectBytes.length) return { dictStr, streamStartOffset: -1, streamEndOffset: -1 };
+
     const endStreamKeywordOffsetRel = findKeywordBytes(objectBytes, ENDSTREAM_BYTES, streamStartOffsetRel);
     if (endStreamKeywordOffsetRel === -1) return { dictStr, streamStartOffset: globalStartOffset + streamStartOffsetRel, streamEndOffset: -1 };
+
     let streamEndOffsetRel = endStreamKeywordOffsetRel;
     while (streamEndOffsetRel > streamStartOffsetRel) {
       const byte = objectBytes[streamEndOffsetRel - 1];
@@ -234,21 +323,10 @@ function initPDFExplorer() {
     return isNaN(num) ? -1 : num;
   }
 
-async function flateDecode(bytes) {
-  // Instead of DecompressionStream, use fflate for better PDF compatibility
-  try {
-    const decodedBytes = fflate.unzlibSync(bytes);
-    return decodedBytes;
-  } catch (err) {
-    throw new Error(`Flate decompression failed: ${err.message}`);
-  }
-}
-
   function parseFilters(dictStr) {
-    // Returns array of filter names, e.g., ['FlateDecode'] or ['FlateDecode','Crypt']
     const single = dictStr.match(/\/Filter\s*\/([A-Za-z0-9]+)\b/);
     if (single) return [single[1]];
-    const arr = dictStr.match(/\/Filter\s*\[\s*([^\]]+)\]/);
+    const arr = dictStr.match(/\/Filter\s*\[([^\]]*)\]/);
     if (!arr) return [];
     const names = [];
     const re = /\/([A-Za-z0-9]+)\b/g;
@@ -257,73 +335,64 @@ async function flateDecode(bytes) {
     return names;
   }
 
-async function extractAndDecodeStream(obj, bytes, txt) {
-  const { raw } = obj;
-  const si = raw.indexOf('stream');
-  if (si === -1) {
-    obj.streamError = 'No stream keyword found';
-    return;
-  }
-
-  const objHeader = `${obj.num} ${obj.gen} obj`;
-  const objStartOffset = txt.indexOf(objHeader);
-  if (objStartOffset === -1) {
-    obj.streamError = 'Could not find object start in file text.';
-    return;
-  }
-  const objEndOffset = txt.indexOf('endobj', objStartOffset);
-  const objBytes = bytes.slice(objStartOffset, objEndOffset + 6);
-
-  const { dictStr, streamStartOffset, streamEndOffset } = extractDictAndStreamBoundsRough(objBytes, objStartOffset);
-  if (!dictStr) {
-    obj.streamError = 'Could not extract dictionary or stream boundaries.';
-    return;
-  }
-
-  const flateFilter = /\/Filter\s*(?:\/FlateDecode|\[\s*\/FlateDecode\b)/.test(dictStr);
-  obj.streamInfo = `Filter: ${flateFilter ? 'FlateDecode' : 'None'}`;
-
-  const lengthMatch = dictStr.match(/\/Length\s*(?:(\d+)\s+(\d+)\s+R|(\d+))/);
-  let officialLength = -1;
-  if (lengthMatch) {
-    if (lengthMatch[1] && lengthMatch[2]) {
-      officialLength = resolveIndirectLength(txt, +lengthMatch[1], +lengthMatch[2]);
-      obj.streamInfo += `, Length: Indirect -> ${officialLength}`;
+  async function extractAndDecodeStream(obj, bytes, txt) {
+    const { raw } = obj;
+    const si = raw.indexOf('stream');
+    if (si === -1) {
+      obj.streamError = 'No stream keyword found';
+      return;
+    }
+    const objHeader = `${obj.num} ${obj.gen} obj`;
+    const objStartOffset = txt.indexOf(objHeader);
+    if (objStartOffset === -1) {
+      obj.streamError = 'Could not find object start in file text.';
+      return;
+    }
+    const objEndOffset = txt.indexOf('endobj', objStartOffset);
+    const objBytes = bytes.slice(objStartOffset, objEndOffset + 6);
+    const { dictStr, streamStartOffset, streamEndOffset } = extractDictAndStreamBoundsRough(objBytes, objStartOffset);
+    if (!dictStr) {
+      obj.streamError = 'Could not extract dictionary or stream boundaries.';
+      return;
+    }
+    const flateFilter = /\/Filter\s*\/FlateDecode\b/.test(dictStr);
+    obj.streamInfo = `Filter: ${flateFilter ? 'FlateDecode' : 'None'}`;
+    const lengthMatch = dictStr.match(/\/Length\s*(?:(\d+)\s+(\d+)\s+R|(\d+))/);
+    let officialLength = -1;
+    if (lengthMatch) {
+      if (lengthMatch[1] && lengthMatch[2]) {
+        officialLength = resolveIndirectLength(txt, +lengthMatch[1], +lengthMatch[2]);
+        obj.streamInfo += `, Length: Indirect -> ${officialLength}`;
+      } else {
+        officialLength = parseInt(lengthMatch[3], 10);
+        obj.streamInfo += `, Length: Direct -> ${officialLength}`;
+      }
+    }
+    if (streamStartOffset === -1) {
+      obj.streamError = 'Could not determine stream start offset.';
+      return;
+    }
+    const start = streamStartOffset;
+    const end = officialLength >= 0 ? Math.min(start + officialLength, bytes.length) : streamEndOffset;
+    if (!(end > start)) {
+      obj.streamError = `Invalid stream bounds (start: ${start}, end: ${end}).`;
+      return;
+    }
+    const streamBytes = bytes.slice(start, end);
+    obj.stream = new TextDecoder('latin1').decode(streamBytes);
+    if (flateFilter) {
+      try {
+        const decodedBytes = fflate.unzlibSync(streamBytes);
+        obj.decoded = new TextDecoder('latin1').decode(decodedBytes);
+        obj.streamInfo += `, Flate decompressed successfully (${decodedBytes.length} bytes)`;
+      } catch (err) {
+        obj.streamError = `Flate decompression failed: ${err.message}`;
+      }
     } else {
-      officialLength = parseInt(lengthMatch[3], 10);
-      obj.streamInfo += `, Length: Direct -> ${officialLength}`;
+      obj.decoded = obj.stream;
+      obj.streamInfo += `, Raw stream used as is`;
     }
   }
-
-  if (streamStartOffset === -1) {
-    obj.streamError = 'Could not determine stream start offset.';
-    return;
-  }
-  const start = streamStartOffset;
-  const end = officialLength >= 0 ? Math.min(start + officialLength, bytes.length) : streamEndOffset;
-  if (!(end > start)) {
-    obj.streamError = `Invalid stream bounds (start: ${start}, end: ${end}).`;
-    return;
-  }
-
-  const streamBytes = bytes.slice(start, end);
-  obj.stream = new TextDecoder('latin1').decode(streamBytes);
-
-  if (flateFilter) {
-    try {
-      const decodedBytes = fflate.unzlibSync(streamBytes);
-      obj.decoded = new TextDecoder('latin1').decode(decodedBytes);
-      obj.streamInfo += `, Flate decompressed successfully (${decodedBytes.length} bytes)`;
-    } catch (err) {
-      obj.streamError = `Flate decompression failed: ${err.message}`;
-    }
-  } else {
-    // If the stream is raw, just use it as is
-    obj.decoded = obj.stream;
-    obj.streamInfo += `, Raw stream used as is`;
-  }
-}
-
 
   function checkEncryption(txt) {
     return /\/Encrypt\b/.test(txt);
@@ -337,11 +406,9 @@ async function extractAndDecodeStream(obj, bytes, txt) {
     const N = N_match ? +N_match[1] : 0;
     const F = F_match ? +F_match[1] : 0;
     if (!N || !F) { debugInfo.push(`[expandObjStm] Missing /N or /First in ${obj.num} ${obj.gen}`); return; }
-
     const headerStr = obj.decoded.slice(0, F).trim();
     const header = headerStr.split(/\s+/).map(Number);
     if (header.length < N * 2) { debugInfo.push(`[expandObjStm] Header length mismatch in ${obj.num} ${obj.gen}`); return; }
-
     let extractedCount = 0;
     for (let i = 0; i < N; i++) {
       const num = header[2 * i];
@@ -355,25 +422,23 @@ async function extractAndDecodeStream(obj, bytes, txt) {
     debugInfo.push(`[expandObjStm] Expanded /ObjStm ${obj.num} ${obj.gen}: extracted ${extractedCount} of ${N} objects`);
   }
 
-async function processObjStmIfNeeded(objNum, gen) {
-  const entry = xrefEntries.get(objNum);
-  if (!entry || entry.type !== 'compressed') return;
-  const objStmKey = `${entry.objStm} 0`;
-  const objStm = objects.get(objStmKey);
-  if (!objStm) { debugInfo.push(`[LazyLoad] /ObjStm ${objStmKey} not found for obj ${objNum} ${gen}`); return; }
-  if (objStm.processed) return;
-
-  debugInfo.push(`[LazyLoad] Decompressing /ObjStm ${objStmKey} for obj ${objNum} ${gen}`);
-  await extractAndDecodeStream(objStm, fileBytes, fileText);
-  objStm.processed = true;
-
-  if (objStm.decoded) {
-    debugInfo.push(`[LazyLoad] /ObjStm ${objStmKey} decoded, expanding objects.`);
-    await expandObjStm(objStm);
-  } else {
-    debugInfo.push(`[LazyLoad] Failed to decode /ObjStm ${objStmKey}: ${objStm.streamError || 'No decoded stream'}`);
+  async function processObjStmIfNeeded(objNum, gen) {
+    const entry = xrefEntries.get(objNum);
+    if (!entry || entry.type !== 'compressed') return;
+    const objStmKey = `${entry.objStm} 0`;
+    const objStm = objects.get(objStmKey);
+    if (!objStm) { debugInfo.push(`[LazyLoad] /ObjStm ${objStmKey} not found for obj ${objNum} ${gen}`); return; }
+    if (objStm.processed) return;
+    debugInfo.push(`[LazyLoad] Decompressing /ObjStm ${objStmKey} for obj ${objNum} ${gen}`);
+    await extractAndDecodeStream(objStm, fileBytes, fileText);
+    objStm.processed = true;
+    if (objStm.decoded) {
+      debugInfo.push(`[LazyLoad] /ObjStm ${objStmKey} decoded, expanding objects.`);
+      await expandObjStm(objStm);
+    } else {
+      debugInfo.push(`[LazyLoad] Failed to decode /ObjStm ${objStmKey}: ${objStm.streamError || 'No decoded stream'}`);
+    }
   }
-}
 
   function readBytes(bytes, start, length) {
     let val = 0;
@@ -417,20 +482,17 @@ async function processObjStmIfNeeded(objNum, gen) {
       return;
     }
     const dict = xrefStreamObj.dict;
-    const wMatch = dict.match(/\/W\s*\[\s*(\d+)\s+(\d+)\s+(\d+)\s*\]/);
+    const wMatch = dict.match(/\/W\s*[\s*(\d+)\s+(\d+)\s+(\d+)\s*]/);
     const indexMatch = dict.match(/\/Index\s*\[([^\]]*)\]/);
     const sizeMatch = dict.match(/\/Size\s+(\d+)/);
     if (!wMatch) { debugInfo.push(`XRef stream ${xrefStreamObj.num} ${xrefStreamObj.gen} missing /W field.`); return; }
-
     const W = wMatch.slice(1, 4).map(Number);
     const Index = indexMatch ? indexMatch[1].trim().split(/\s+/).map(Number).filter(n => !isNaN(n)) : [0, sizeMatch ? parseInt(sizeMatch[1]) : 0];
     const data = new Uint8Array(xrefStreamObj.decoded.length);
     for (let i = 0; i < xrefStreamObj.decoded.length; i++) data[i] = xrefStreamObj.decoded.charCodeAt(i);
-
     const [w0, w1, w2] = W;
     const entrySize = w0 + w1 + w2;
     let byteIdx = 0;
-
     for (let i = 0; i < Index.length; i += 2) {
       const startObj = Index[i];
       const count = Index[i + 1];
@@ -449,86 +511,59 @@ async function processObjStmIfNeeded(objNum, gen) {
     debugInfo.push(`Parsed ${xrefEntries.size} entries from XRef stream ${xrefStreamObj.num} ${xrefStreamObj.gen}`);
   }
 
-  function extractFontDict(dictStr) {
-    const fontMatch = dictStr.match(/\/Font\s*<<([\s\S]*?)>>/);
-    if (!fontMatch) return null;
-    const fontDictStr = fontMatch[1];
-    let nesting = 0;
-    let fontDictEnd = -1;
-    for (let i = 0; i < fontDictStr.length - 1; i++) {
-      if (fontDictStr[i] === '<' && fontDictStr[i + 1] === '<') {
-        nesting++; i++;
-      } else if (fontDictStr[i] === '>' && fontDictStr[i + 1] === '>') {
-        nesting--;
-        if (nesting === -1) {
-          fontDictEnd = i + 2; break;
-        }
-        i++;
+  async function cacheFontsFromResources(resourcesDict, pageKey) {
+    debugInfo.push(`[FontCache] Raw /Resources dictionary for page ${pageKey}: ${resourcesDict}`);
+    const fontMatch = resourcesDict.match(/\/Font\s*(<<[\s\S]*?>>|<[^>]*\d+\s+\d+\s+R[^>]*>|[\s*\d+\s+\d+\s+R\s*])/);
+    if (!fontMatch) {
+      debugInfo.push(`[FontCache] No /Font dictionary found in /Resources for page ${pageKey}`);
+      return;
+    }
+    let fontContainer = fontMatch[1] || '';
+    const refOnly = fontContainer.replace(/[<>[]]/g, ' ').match(/(^|\s)(\d+)\s+(\d+)\s+R(?=\s|$)/);
+    if (refOnly) {
+      const objNum = +refOnly[2], genNum = +refOnly[3];
+      await processObjStmIfNeeded(objNum, genNum);
+      const fontDictObj = objects.get(`${objNum} ${genNum}`);
+      if (!fontDictObj) {
+        debugInfo.push(`[FontCache] /Font ref ${objNum} ${genNum} not found for page ${pageKey}`);
+        return;
       }
+      fontContainer = fontDictObj.dict || '';
+      debugInfo.push(`[FontCache] /Font is indirect -> using dict of ${objNum} ${genNum}: ${fontContainer}`);
     }
-    if (fontDictEnd !== -1) {
-      return fontDictStr.substring(0, fontDictEnd);
-    }
-    return fontDictStr;
-  }
-
-async function cacheFontsFromResources(resourcesDict, pageKey) {
-  debugInfo.push(`[FontCache] Raw /Resources dictionary for page ${pageKey}: ${resourcesDict}`);
-
-  // 1) Extract /Font dictionary (be tolerant of malformed delimiters)
-  const fontDictMatch = resourcesDict.match(/\/Font\s*(<<[\s\S]*?>>|<\s*\d+\s+\d+\s+R\s*>+)/);
-  if (!fontDictMatch) {
-    debugInfo.push(`[FontCache] No /Font dictionary found in /Resources for page ${pageKey}`);
-    return;
-  }
-
-  const fontDictStr = fontDictMatch[1] || "";
-  debugInfo.push(`[FontCache] Raw /Font dictionary for page ${pageKey}: ${fontDictStr}`);
-
-  // 2) Find all font entries inside the dictionary
-  const fontEntries = fontDictStr.match(/\/[A-Za-z0-9\-\+]+\s+[^>\s]+/g) || [];
-  if (fontEntries.length === 0) {
-    debugInfo.push(`[FontCache] No font entries found in /Font dictionary for page ${pageKey}`);
-    return;
-  }
-  debugInfo.push(`[FontCache] Found ${fontEntries.length} font entries in /Font dictionary for page ${pageKey}: ${fontEntries.join(', ')}`);
-
-  // 3) Process each font entry
-  for (let entry of fontEntries) {
-    let fontKey = null;
-    let fontBody = null;
-
-    // --- Sanitize malformed stuff like "<4 0 R>>>" -> "4 0 R"
-    const cleanEntry = entry.replace(/[<>]+/g, " ").replace(/\s+/g, " ").trim();
-
-    // Match: /F4 4 0 R   OR   just 4 0 R
-    const refMatch = cleanEntry.match(/\/?([A-Za-z0-9\-\+]+)?\s*(\d+)\s+(\d+)\s+R/);
-    const inlineMatch = cleanEntry.match(/\/([A-Za-z0-9\-\+]+)\s*<<([\s\S]*?)>>/);
-
-    if (refMatch) {
-      fontKey = refMatch[1] || `F${refMatch[2]}`;
-      const objNum = +refMatch[2];
-      const gen = +refMatch[3];
-      const fontObjKey = `${objNum} ${gen}`;
-      await processObjStmIfNeeded(objNum, gen);
-      const fontObj = objects.get(fontObjKey);
-      if (!fontObj) {
-        debugInfo.push(`[FontCache] Font object ${fontObjKey} not found for ${fontKey} in page ${pageKey}`);
+    const entryRe = /\/([A-Za-z0-9\-\+]+)\s*(?:(<<[\s\S]*?>>)|(<[^>]*(\d+)\s+(\d+)\s+R[^>]*>))/g;
+    let m, found = 0;
+    while ((m = entryRe.exec(fontContainer))) {
+      const fontKey = m[1];
+      const inlineBody = m[2];
+      const refNum = m[4] ? +m[4] : null;
+      const refGen = m[5] ? +m[5] : null;
+      let fontBody = '';
+      if (inlineBody) {
+        fontBody = inlineBody;
+      } else if (refNum !== null) {
+        const k = `${refNum} ${refGen}`;
+        await processObjStmIfNeeded(refNum, refGen);
+        const fObj = objects.get(k);
+        if (!fObj) {
+          debugInfo.push(`[FontCache] Font object ${k} not found for ${fontKey} in page ${pageKey}`);
+          continue;
+        }
+        fontBody = fObj.dict || '';
+      } else {
         continue;
       }
-      fontBody = fontObj.dict || '';
-
-      // 🔍 Follow /FontDescriptor to check for embedded font program
-      const descMatch = fontBody.match(/\/FontDescriptor\s+(\d+)\s+(\d+)\s+R/);
-      if (descMatch) {
-        const descKey = `${descMatch[1]} ${descMatch[2]}`;
-        await processObjStmIfNeeded(+descMatch[1], +descMatch[2]);
+      found++;
+      const descRef = fontBody.match(/\/FontDescriptor\s+(\d+)\s+(\d+)\s+R/);
+      if (descRef) {
+        const descKey = `${+descRef[1]} ${+descRef[2]}`;
+        await processObjStmIfNeeded(+descRef[1], +descRef[2]);
         const descObj = objects.get(descKey);
         if (descObj) {
-          const fontFileMatch = descObj.dict.match(/\/FontFile[123]?\s+(\d+)\s+(\d+)\s+R/);
-          if (fontFileMatch) {
-            const fileKey = `${fontFileMatch[1]} ${fontFileMatch[2]}`;
-            await processObjStmIfNeeded(+fontFileMatch[1], +fontFileMatch[2]);
+          const ffRef = (descObj.dict || '').match(/\/FontFile[123]?\s+(\d+)\s+(\d+)\s+R/);
+          if (ffRef) {
+            const fileKey = `${+ffRef[1]} ${+ffRef[2]}`;
+            await processObjStmIfNeeded(+ffRef[1], +ffRef[2]);
             const fileObj = objects.get(fileKey);
             if (fileObj && !fileObj.processed) {
               await extractAndDecodeStream(fileObj, fileBytes, fileText);
@@ -538,41 +573,30 @@ async function cacheFontsFromResources(resourcesDict, pageKey) {
               debugInfo.push(`[FontCache] Embedded font extracted for ${fontKey}, ${fileObj.decoded.length} bytes`);
               fontCache.set(fontKey, {
                 type: (fontBody.match(/\/Subtype\s*\/(\w+)/) || [])[1] || 'Unknown',
-                name: (fontBody.match(/\/BaseFont\s*\/([^\s\/]+)/) || [])[1] || 'Unknown',
-                encoding: (fontBody.match(/\/Encoding\s*\/([^\s\/]+)/) || [])[1] || 'StandardEncoding',
-                ttf: fileObj.decoded,  // raw embedded font data
+                name: (fontBody.match(/\/BaseFont\s*\/([^\s/]+)/) || [])[1] || 'Unknown',
+                encoding: (fontBody.match(/\/Encoding\s*\/([^\s/]+)/) || [])[1] || 'StandardEncoding',
+                ttf: fileObj.decoded,
                 extension: 'ttf'
               });
-              continue; // skip normal set
+              continue;
             }
           }
         }
       }
-
-    } else if (inlineMatch) {
-      fontKey = inlineMatch[1];
-      fontBody = inlineMatch[2];
-      debugInfo.push(`[FontCache] Processing inline font ${fontKey} for page ${pageKey}: ${fontBody}`);
-    } else {
-      debugInfo.push(`[FontCache] Invalid font entry format for ${entry} in page ${pageKey}`);
-      continue;
+      fontCache.set(fontKey, {
+        type: (fontBody.match(/\/Subtype\s*\/(\w+)/) || [])[1] || 'Unknown',
+        name: (fontBody.match(/\/BaseFont\s*\/([^\s/]+)/) || [])[1] || 'Unknown',
+        encoding: (fontBody.match(/\/Encoding\s*\/([^\s/]+)/) || [])[1] || 'StandardEncoding',
+        ttf: null,
+        extension: null
+      });
     }
-
-    // 4) Fallback: record base info even if no embedded font
-    const subtype = (fontBody.match(/\/Subtype\s*\/(\w+)/) || [])[1] || 'Unknown';
-    const baseFont = (fontBody.match(/\/BaseFont\s*\/([^\s\/]+)/) || [])[1] || 'Unknown';
-    const encoding = (fontBody.match(/\/Encoding\s*\/([^\s\/]+)/) || [])[1] || 'StandardEncoding';
-
-    fontCache.set(fontKey, {
-      type: subtype,
-      name: baseFont,
-      encoding: encoding,
-      ttf: null,
-      extension: null
-    });
+    if (!found) {
+      debugInfo.push(`[FontCache] /Font dict parsed but no entries found for page ${pageKey}`);
+    } else {
+      debugInfo.push(`[FontCache] Parsed ${found} font entries for page ${pageKey}`);
+    }
   }
-}
-
 
   function collectIndirectObjects(txt) {
     const re = /(\d+)\s+(\d+)\s+obj([\s\S]*?)endobj/g;
@@ -715,7 +739,7 @@ async function cacheFontsFromResources(resourcesDict, pageKey) {
   }
 
   async function getPageContent(obj) {
-    const contentsMatch = (obj.dict || '').match(/\/Contents\s*(?:(\d+)\s+(\d+)\s+R|\[([\s\S]*?)\])/);
+    const contentsMatch = (obj.dict || '').match( /\/Contents\s*(?:(\d+)\s+(\d+)\s+R|\[([\s\S]*?)\])/ );
     let content = '';
     if (contentsMatch) {
       if (contentsMatch[1] && contentsMatch[2]) {
@@ -752,91 +776,80 @@ async function cacheFontsFromResources(resourcesDict, pageKey) {
   }
 
   function linkify(s) {
-    return s.replace(/(\d+)\s+(\d+)\s+R/g, (m, n, g) => {
-      const id = `${n} ${g}`;
-      return `<a class="ref" data-obj="${id}" title="Click to view object ${id}">${m}</a>`;
+    // [FIXED] This regex is now more tolerant. It finds object references
+    // even if they are incorrectly wrapped in extra brackets.
+    // It captures the full malformed text (like `<4 0 R>>`) and makes the whole thing a link.
+    return s.replace(/[<[]*\s*(\d+)\s+(\d+)\s+R\s*[>\]]*/g, (fullMatch, num, gen) => {
+      const id = `${num} ${gen}`;
+      return `<a class="ref" data-obj="${id}" title="Click to view object ${id}">${fullMatch}</a>`;
     });
   }
 
-async function show(key) {
-  const [num, gen] = key.split(' ').map(Number);
-  await processObjStmIfNeeded(num, gen);
-  const o = objects.get(key);
-  if (!o) {
-    $out.textContent = `Object ${key} not found.`;
-    document.getElementById('outputContainer').innerHTML = '';
-    return;
-  }
-  if (o.raw.indexOf('stream') !== -1 && !o.processed) {
-    await extractAndDecodeStream(o, fileBytes, fileText);
-    o.processed = true;
-  }
-  let txt = `Object ${key} obj\n`;
-  txt += linkify(o.dict || o.raw);
-  const isPage = /\/Type\s*\/Page\b/.test(o.dict || '');
-  if (isPage) {
-    txt += `\n\n----- Fonts for Page ${key} -----\n`;
-    if (fontCache.size === 0) {
-      txt += 'No fonts cached for this page.\n';
-    } else {
-      for (const [fontKey, fontData] of fontCache) {
-        let line = `${fontKey}: Type=${fontData.type}, Name=${fontData.name}, Encoding=${fontData.encoding}`;
-        if (fontData.ttf) line += `, TTF Data=${fontData.ttf.byteLength} bytes, Extension=${fontData.extension}`;
-        txt += line + '\n';
-      }
+  async function show(key) {
+    const [num, gen] = key.split(' ').map(Number);
+    await processObjStmIfNeeded(num, gen);
+    const o = objects.get(key);
+    if (!o) {
+      $out.textContent = `Object ${key} not found.`;
+      document.getElementById('outputContainer').innerHTML = '';
+      return;
     }
-    const content = await getPageContent(o);
-    if (content) {
-      txt += `\n\n----- Content Stream -----\n${content}`;
-      const mediaBoxMatch = (o.dict || '').match(/\/MediaBox\s*\[\s*(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s*\]/);
-      const mediaBox = mediaBoxMatch ? mediaBoxMatch.slice(1, 5).map(Number) : [0, 0, 612, 792];
-      const width = mediaBox[2] - mediaBox[0];
-      const height = mediaBox[3] - mediaBox[1];
-      const outCont = document.getElementById('outputContainer');
-      const wrapper = document.getElementById('viewportWrapper');
-
-      const wrapperWidth = wrapper.clientWidth;
-      const wrapperHeight = wrapper.clientHeight;
-      const scale = Math.min(wrapperWidth / width, wrapperHeight / height);
-
-      outCont.style.width = `${width}px`;
-      outCont.style.height = `${height}px`;
-      outCont// REMOVED double scaling: .style.transform = `scale(${scale})`;
-
-      outCont.innerHTML = '';
-      if (typeof window.renderPage === 'function') {
-        try {
-          await window.renderPage({
-            content,
-            fontCache,
-            width,
-            height,
-            xrefEntries,
-            objects,
-            fileBytes
-          }, outCont, wrapper);
-        } catch (err) {
-          console.error(`[Render] Failed to render page ${key}: ${err.message}`);
-          debugInfo.push(`[Render] Failed to render page ${key}: ${err.message}`);
-          txt += `\n\n----- Render Error -----\nFailed to render page: ${err.message}`;
+    if (o.raw.indexOf('stream') !== -1 && !o.processed) {
+      await extractAndDecodeStream(o, fileBytes, fileText);
+      o.processed = true;
+    }
+    let txt = `Object ${key} obj\n`;
+    // Use the dictionary if valid, otherwise fall back to the raw content.
+    // The new linkify function can handle the raw content's potential errors.
+    txt += linkify(o.dict || o.raw);
+    const isPage = /\/Type\s*\/Page\b/.test(o.dict || '');
+    if (isPage) {
+      txt += `\n\n----- Fonts for Page ${key} -----\n`;
+      if (fontCache.size === 0) {
+        txt += 'No fonts cached for this page.\n';
+      } else {
+        for (const [fontKey, fontData] of fontCache) {
+          let line = `${fontKey}: Type=${fontData.type}, Name=${fontData.name}, Encoding=${fontData.encoding}`;
+          if (fontData.ttf) line += `, TTF Data=${fontData.ttf.byteLength} bytes, Extension=${fontData.extension}`;
+          txt += line + '\n';
+        }
+      }
+      const content = await getPageContent(o);
+      if (content) {
+        txt += `\n\n----- Content Stream -----\n${content}`;
+        const mediaBoxMatch = (o.dict || '').match(/\/MediaBox\s*[\s*(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s*]/);
+        const mediaBox = mediaBoxMatch ? mediaBoxMatch.slice(1, 5).map(Number) : [0, 0, 612, 792];
+        const width = mediaBox[2] - mediaBox[0];
+        const height = mediaBox[3] - mediaBox[1];
+        const outCont = document.getElementById('outputContainer');
+        const wrapper = document.getElementById('viewportWrapper');
+        outCont.style.width = `${width}px`;
+        outCont.style.height = `${height}px`;
+        outCont.innerHTML = '';
+        if (typeof window.renderPage === 'function') {
+          try {
+            await window.renderPage({ content, fontCache, width, height, xrefEntries, objects, fileBytes }, outCont, wrapper);
+          } catch (err) {
+            console.error(`[Render] Failed to render page ${key}: ${err.message}`);
+            debugInfo.push(`[Render] Failed to render page ${key}: ${err.message}`);
+            txt += `\n\n----- Render Error -----\nFailed to render page: ${err.message}`;
+          }
+        } else {
+          console.error(`[Render] window.renderPage is not defined for page ${key}`);
+          debugInfo.push(`[Render] window.renderPage is not defined for page ${key}`);
+          txt += `\n\n----- Render Error -----\nRendering is not available (text-vector.js not loaded).`;
         }
       } else {
-        console.error(`[Render] window.renderPage is not defined for page ${key}`);
-        debugInfo.push(`[Render] window.renderPage is not defined for page ${key}`);
-        txt += `\n\n----- Render Error -----\nRendering is not available (text-vector.js not loaded).`;
+        txt += `\n\n----- Content Stream -----\nNo content stream found.`;
+        document.getElementById('outputContainer').innerHTML = '';
       }
-    } else {
-      txt += `\n\n----- Content Stream -----\nNo content stream found.`;
-      document.getElementById('outputContainer').innerHTML = '';
     }
+    if (o.streamError) txt += `\n\n----- stream decode error -----\n${o.streamError}`;
+    if (o.streamInfo) txt += `\n\n----- stream info -----\n${o.streamInfo}`;
+    if (o.decoded && !isPage) txt += `\n\n----- decoded stream -----\n${o.decoded.trim()}`;
+    else if (o.stream) txt += `\n\n----- raw stream (${o.stream.length} bytes) -----`;
+    $out.innerHTML = '<pre>' + txt + '</pre>';
   }
-  if (o.streamError) txt += `\n\n----- stream decode error -----\n${o.streamError}`;
-  if (o.streamInfo) txt += `\n\n----- stream info -----\n${o.streamInfo}`;
-  if (o.decoded && !isPage) txt += `\n\n----- decoded stream -----\n${o.decoded.trim()}`;
-  else if (o.stream) txt += `\n\n----- raw stream (${o.stream.length} bytes) -----`;
-  $out.innerHTML = '<pre>' + txt + '</pre>';
-}
-
 
   function showDebugInfo() {
     let html = '<div class="debug-info"><h3>Debug Information</h3>';
@@ -886,15 +899,12 @@ async function show(key) {
     console.clear();
     console.log("--- Starting PDF Parse ---");
     debugInfo = [`=== PDF Parse Debug Info ===`, `File size: ${buf.byteLength} bytes`];
-
     collectIndirectObjects(fileText);
     console.log(`[Step 1] Found ${objects.size} classic objects.`);
     debugInfo.push(`[Step 1] Found ${objects.size} classic objects.`);
-
     await discoverRootAndXrefs(fileText, fileBytes);
     console.log(`[Step 2] Parsed XRef, root key: ${rootKey || 'none'}.`);
     debugInfo.push(`[Step 2] Parsed XRef, root key: ${rootKey || 'none'}`);
-
     if (rootKey && objects.has(rootKey)) {
       console.log("[Step 3] Traversing page tree from /Root...");
       await collectPagesFromRoot(rootKey);
@@ -904,14 +914,12 @@ async function show(key) {
       console.warn("[Step 3] Root object identified but not found in objects.");
       debugInfo.push(`[Step 3] WARNING: Root ${rootKey} identified but not found`);
     }
-
     if (!pages.length) {
       console.warn('[Step 4] No pages via /Root tree. Fallback scanning /Type /Page.');
       await collectPages();
       console.log(`[Step 4] Found ${pages.length} pages via fallback scan.`);
       debugInfo.push(`[Step 4] Found ${pages.length} pages via fallback scan`);
     }
-
     const isEncrypted = checkEncryption(fileText);
     if (isEncrypted) {
       debugInfo.push(`[Step 5] WARNING: PDF appears to be encrypted - streams cannot be decoded`);
@@ -919,7 +927,6 @@ async function show(key) {
       $out.textContent = 'PDF is encrypted. Stream decoding is not supported.';
       return;
     }
-
     console.log("--- Parse Complete ---");
     buildUI();
   });
@@ -974,97 +981,18 @@ async function show(key) {
 
 window.addEventListener('load', initPDFExplorer);
 </script>
-<script>
-(() => {
-  const KEY = '__pdfFitSingleton__';
-  if (window[KEY]) return;
-  window[KEY] = true;
-
-  const Z = {
-    padding: 16,
-    minScale: 0.05,
-    maxScale: 20,
-    wrapperId: 'viewportWrapper',
-    containerId: 'outputContainer',
-    pageW: null,
-    pageH: null,
-  };
-
-  function clamp(n,a,b){ return Math.max(a, Math.min(b,n)); }
-  function els(){ return {
-    wrap: document.getElementById(Z.wrapperId),
-    out:  document.getElementById(Z.containerId),
-  }; }
-
-  function getPageSize(out) {
-    const w = Z.pageW || parseFloat(out.style.width)  || out.offsetWidth  || 1024;
-    const h = Z.pageH || parseFloat(out.style.height) || out.offsetHeight || 1024;
-    return { w, h };
-  }
-
-  function layout() {
-    const { wrap, out } = els();
-    if (!wrap || !out) return;
-
-    const { w:pageW, h:pageH } = getPageSize(out);
-    out.style.width  = pageW + 'px';
-    out.style.height = pageH + 'px';
-
-    const vw = wrap.clientWidth  - Z.padding*2;
-    const vh = wrap.clientHeight - Z.padding*2;
-    let S = Math.min(vw / pageW, vh / pageH);
-    S = clamp(S, Z.minScale, Z.maxScale);
-
-    const tx = Math.floor((wrap.clientWidth  - pageW * S) / 2);
-    const ty = Math.floor((wrap.clientHeight - pageH * S) / 2);
-
-    out.style.transformOrigin = 'left top';
-    out// REMOVED double scaling: .style.transform = `translate(${tx}px, ${ty}px) scale(${S})`;
-  }
-
-  // expose manual hook
-  window.fitPDFViewport = layout;
-
-  // when a new doc/page starts, tell us its size
-  window.onPDFPageStart = function(pageW, pageH) {
-    if (typeof pageW === 'number' && typeof pageH === 'number') {
-      Z.pageW = pageW;
-      Z.pageH = pageH;
-    }
-    requestAnimationFrame(layout);
-  };
-
-  // hook into renderPage once
-  const origRender = window.renderPage;
-  if (typeof origRender === 'function') {
-    window.renderPage = async function(...args) {
-      const params = args[0] || {};
-      // 👇 grab real width/height if renderer provides them
-      const pw = params.pageWidth  || params.width;
-      const ph = params.pageHeight || params.height;
-      if (typeof pw === 'number' && typeof ph === 'number') {
-        Z.pageW = pw;
-        Z.pageH = ph;
-      }
-      const res = await origRender.apply(this, args);
-      requestAnimationFrame(layout);
-      return res;
-    };
-  }
-
-  window.addEventListener('resize', () => requestAnimationFrame(layout));
-})();
-</script>
-
 <script src="text-vector.js"></script>
 <script src="image.js"></script>
 
-<!-- Injected unified PDF viewport fitter and public zoom API -->
+<!-- Unified and Consolidated PDF Viewport and Zoom Control Script -->
 <script>
 (() => {
-  // Shared zoom state (single source of truth)
+  const KEY = '__pdfViewportControllerSingleton__';
+  if (window[KEY]) return;
+  window[KEY] = true;
+
   const ZS = {
-    mode: 'fit-page',  // 'fit-page' | 'fit-width' | 'fit-height' | 'custom'
+    mode: 'fit-page',
     zoom: 1,
     min: 0.05,
     max: 20,
@@ -1073,273 +1001,103 @@ window.addEventListener('load', initPDFExplorer);
 
   function clamp(n, a, b){ return Math.max(a, Math.min(b, n)); }
 
-  // Keep original implementations if they exist
-  const originalFit = window.fitPDFViewport;
-  const originalOnStart = window.onPDFPageStart;
-
-  // Provide default onPDFPageStart if none exists
-  if (typeof window.onPDFPageStart !== 'function') {
-    window.onPDFPageStart = function(pageW, pageH) {
-      // no-op default
-    };
-  }
-
-  // Wrap/replace fitPDFViewport to honor ZS
-  window.fitPDFViewport = function fitPDFViewport() {
-    const wrap = document.getElementById('viewportWrapper') || document.getElementById('viewport') || document.body;
-    const out  = document.getElementById('outputContainer') || document.getElementById('output') || document.body;
-    if (!wrap || !out) return;
-
-    const pageW = parseFloat(out.style.width)  || out.offsetWidth  || 1024;
-    const pageH = parseFloat(out.style.height) || out.offsetHeight || 1024;
-
-    const vw = (wrap.clientWidth  || window.innerWidth)  - ZS.padding * 2;
-    const vh = (wrap.clientHeight || window.innerHeight) - ZS.padding * 2;
-
-    let S;
-    if (ZS.mode === 'fit-width')       S = vw / pageW;
-    else if (ZS.mode === 'fit-height') S = vh / pageH;
-    else if (ZS.mode === 'custom')     S = ZS.zoom;
-    else                               S = Math.min(vw / pageW, vh / pageH); // fit-page
-
-    S = clamp(S, ZS.min, ZS.max);
-
-    const tx = Math.floor(((wrap.clientWidth  || window.innerWidth)  - pageW * S) / 2);
-    const ty = Math.floor(((wrap.clientHeight || window.innerHeight) - pageH * S) / 2);
-
-    out.style.transformOrigin = 'left top';
-    out.style.transform = `translate(${tx}px, ${ty}px) scale(${S})`;
-
-    if (typeof originalFit === 'function') {
-      try { originalFit(); } catch (e) { /* ignore */ }
-    }
-  };
-
-  // Ensure that when a new page layout is known, we refit
-  const _onStart = window.onPDFPageStart;
-  window.onPDFPageStart = function(pageW, pageH) {
-    try { if (typeof originalOnStart === 'function') originalOnStart(pageW, pageH); } catch(e){}
-    try { if (typeof _onStart === 'function' && _onStart !== window.onPDFPageStart) _onStart(pageW, pageH); } catch(e){}
-    requestAnimationFrame(window.fitPDFViewport);
-  };
-
-  // Public controls used by buttons
-  window.fitPage    = () => { ZS.mode = 'fit-page';   window.fitPDFViewport(); };
-  window.fitWidth   = () => { ZS.mode = 'fit-width';  window.fitPDFViewport(); };
-  window.fitHeight  = () => { ZS.mode = 'fit-height'; window.fitPDFViewport(); };
-  window.zoomTo     = (v) => { ZS.mode = 'custom'; ZS.zoom = clamp(Number(v)||1, ZS.min, ZS.max); window.fitPDFViewport(); };
-  window.getPDFZoom = () => ({ mode: ZS.mode, value: ZS.mode === 'custom' ? ZS.zoom : null });
-
-  // Keep things responsive
-  window.addEventListener('resize', () => requestAnimationFrame(window.fitPDFViewport));
-
-  // Auto-fit on DOM ready
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', () => requestAnimationFrame(window.fitPDFViewport));
-  } else {
-    requestAnimationFrame(window.fitPDFViewport);
-  }
-})();
-</script>
-
-<!-- Auto-fit on intrinsic page size changes (upload/render) -->
-<script>
-(() => {
-  function scheduleRefits() {
-    // burst refits to catch async layout/paint
-    requestAnimationFrame(window.fitPDFViewport);
-    setTimeout(window.fitPDFViewport, 30);
-    setTimeout(window.fitPDFViewport, 120);
-  }
-
-  // Force default to fit-page at startup (overrides any previous custom)
-  if (typeof window.fitPage === 'function') {
-    try { window.fitPage(); } catch(e){}
-  } else {
-    // fallback: run the viewport fitter if available
-    if (typeof window.fitPDFViewport === 'function') scheduleRefits();
-  }
-
-  // Refit whenever outputContainer's intrinsic size changes (e.g., new PDF page rendered)
-  const out = document.getElementById('outputContainer') || document.getElementById('output');
-  if (out && 'ResizeObserver' in window) {
-    const ro = new ResizeObserver(() => {
-      // Only auto-fit when we're in an auto mode (fit-page/fit-width/fit-height).
-      // If user picked custom zoom, don't override.
-      const z = (typeof window.getPDFZoom === 'function') ? window.getPDFZoom() : null;
-      const autoMode = !z || z.mode === 'fit-page' || z.mode === 'fit-width' || z.mode === 'fit-height';
-      if (autoMode && typeof window.fitPDFViewport === 'function') scheduleRefits();
-    });
-    ro.observe(out);
-  }
-
-  // Provide a global you can call after you finish loading a new file:
-  //   window.onPDFFileLoaded()
-  // It resets to "fit page" and refits.
-  window.onPDFFileLoaded = function() {
-    if (typeof window.fitPage === 'function') window.fitPage();
-    scheduleRefits();
-  };
-})();
-</script>
-
-<!-- Aggressive auto-fit: better size detection + mutation observer -->
-<script>
-(() => {
-  // Utility: clamp
-  function clamp(n, a, b){ return Math.max(a, Math.min(b, n)); }
-
-  // Robust page size detection
   function detectPageSize(out){
-    // 1) Explicit width/height styles (from renderer)
     let w = parseFloat(out.style.width);
     let h = parseFloat(out.style.height);
-
-    // 2) Prefer first child element natural size (canvas/svg/img)
     const c = out.firstElementChild;
-    if ((!w || !h) && c){
-      // Canvas
-      if (c.tagName === 'CANVAS' && c.width && c.height){
-        w = w || c.width;
-        h = h || c.height;
-      }
-      // SVG
-      if (c.tagName === 'SVG'){
+    if ((!w || !h) && c) {
+      if (c.tagName === 'CANVAS' && c.width && c.height) { w = w || c.width; h = h || c.height; }
+      if (c.tagName === 'SVG') {
         const vb = c.getAttribute('viewBox');
-        if (vb){
+        if (vb) {
           const parts = vb.trim().split(/[ ,]+/).map(Number);
-          if (parts.length === 4){
-            w = w || parts[2];
-            h = h || parts[3];
-          }
+          if (parts.length === 4) { w = w || parts[2]; h = h || parts[3]; }
         }
         const sw = parseFloat(c.getAttribute('width'));
         const sh = parseFloat(c.getAttribute('height'));
         if (!w && sw) w = sw;
         if (!h && sh) h = sh;
       }
-      // IMG
-      if (c.tagName === 'IMG' && c.naturalWidth && c.naturalHeight){
-        w = w || c.naturalWidth;
-        h = h || c.naturalHeight;
-      }
-      // Fallback to offset if nothing else
-      if ((!w || !h) && c.offsetWidth && c.offsetHeight){
-        w = w || c.offsetWidth;
-        h = h || c.offsetHeight;
-      }
+      if (c.tagName === 'IMG' && c.naturalWidth && c.naturalHeight) { w = w || c.naturalWidth; h = h || c.naturalHeight; }
+      if ((!w || !h) && c.offsetWidth && c.offsetHeight) { w = w || c.offsetWidth; h = h || c.offsetHeight; }
     }
-
-    // 3) Fallback to scroll sizes (ignores transforms)
-    if (!w || !h){
-      const sw = out.scrollWidth;
-      const sh = out.scrollHeight;
-      if (sw && sh){
-        w = w || sw;
-        h = h || sh;
-      }
+    if (!w || !h) {
+      if (out.scrollWidth && out.scrollHeight) { w = w || out.scrollWidth; h = h || out.scrollHeight; }
     }
-
-    // Sensible defaults as absolute last resort
-    w = w || 1024;
-    h = h || 1024;
-    return { w, h };
+    return { w: w || 1024, h: h || 1024 };
   }
 
-  // Override fitPDFViewport with more robust sizing
-  const prevFit = window.fitPDFViewport;
-  window.fitPDFViewport = function fitPDFViewport(){
-    const wrap = document.getElementById('viewportWrapper') || document.getElementById('viewport') || document.body;
-    const out  = document.getElementById('outputContainer') || document.getElementById('output') || document.body;
+  window.fitPDFViewport = function fitPDFViewport() {
+    const wrap = document.getElementById('viewportWrapper');
+    const out = document.getElementById('outputContainer');
     if (!wrap || !out) return;
 
     const { w: pageW, h: pageH } = detectPageSize(out);
-
-    // Read zoom state if provided by previous script
-    let mode = 'fit-page', zoom = 1, min = 0.05, max = 20, pad = 16;
-    if (typeof window.getPDFZoom === 'function'){
-      const z = window.getPDFZoom();
-      if (z && z.mode) mode = z.mode;
-      if (z && z.value) zoom = Number(z.value) || 1;
-    }
-    // Try to peek at ZS if defined (not required)
-    try {
-      if (window.ZS) { min = window.ZS.min || min; max = window.ZS.max || max; pad = window.ZS.padding || pad; }
-    } catch(e){}
-
-    const vw = (wrap.clientWidth  || window.innerWidth)  - pad * 2;
-    const vh = (wrap.clientHeight || window.innerHeight) - pad * 2;
+    const vw = wrap.clientWidth - ZS.padding * 2;
+    const vh = wrap.clientHeight - ZS.padding * 2;
 
     let S;
-    if (mode === 'fit-width')       S = vw / pageW;
-    else if (mode === 'fit-height') S = vh / pageH;
-    else if (mode === 'custom')     S = zoom;
-    else                            S = Math.min(vw / pageW, vh / pageH); // fit-page
-    S = clamp(S, min, max);
+    if (ZS.mode === 'fit-width')       S = vw / pageW;
+    else if (ZS.mode === 'fit-height') S = vh / pageH;
+    else if (ZS.mode === 'custom')     S = ZS.zoom;
+    else                               S = Math.min(vw / pageW, vh / pageH);
 
-    const tx = Math.floor(((wrap.clientWidth  || window.innerWidth)  - pageW * S) / 2);
-    const ty = Math.floor(((wrap.clientHeight || window.innerHeight) - pageH * S) / 2);
+    S = clamp(S, ZS.min, ZS.max);
+
+    const tx = Math.floor((wrap.clientWidth - pageW * S) / 2);
+    const ty = Math.floor((wrap.clientHeight - pageH * S) / 2);
 
     out.style.transformOrigin = 'left top';
     out.style.transform = `translate(${tx}px, ${ty}px) scale(${S})`;
-
-    if (typeof prevFit === 'function'){
-      try { prevFit(); } catch(e){}
-    }
   };
 
-  // Aggressive auto-fit strategy:
-  function burstRefit(){
+  window.fitPage    = () => { ZS.mode = 'fit-page';   window.fitPDFViewport(); };
+  window.fitWidth   = () => { ZS.mode = 'fit-width';  window.fitPDFViewport(); };
+  window.fitHeight  = () => { ZS.mode = 'fit-height'; window.fitPDFViewport(); };
+  window.zoomTo     = (v) => { ZS.mode = 'custom'; ZS.zoom = clamp(Number(v)||1, ZS.min, ZS.max); window.fitPDFViewport(); };
+  window.getPDFZoom = () => ({ mode: ZS.mode, value: ZS.mode === 'custom' ? ZS.zoom : null });
+
+  function burstRefit() {
     requestAnimationFrame(window.fitPDFViewport);
-    setTimeout(window.fitPDFViewport, 16);
-    setTimeout(window.fitPDFViewport, 64);
-    setTimeout(window.fitPDFViewport, 128);
-    setTimeout(window.fitPDFViewport, 256);
+    setTimeout(window.fitPDFViewport, 50);
+    setTimeout(window.fitPDFViewport, 150);
   }
 
-  // Always start in fit-page
-  if (typeof window.fitPage === 'function') {
-    try { window.fitPage(); } catch(e){}
-  }
-  burstRefit();
+  window.onPDFFileLoaded = function() {
+    window.fitPage();
+    burstRefit();
+  };
 
-  // Observe #outputContainer for child changes and attribute tweaks
-  const out = document.getElementById('outputContainer') || document.getElementById('output');
-  if (out){
-    const mo = new MutationObserver((muts) => {
-      // Only auto-fit when using auto modes
-      let mode = 'fit-page';
-      if (typeof window.getPDFZoom === 'function'){
-        const z = window.getPDFZoom();
-        if (z && z.mode) mode = z.mode;
-      }
-      const autoMode = mode === 'fit-page' || mode === 'fit-width' || mode === 'fit-height';
-      if (!autoMode) return;
-      // If children added/removed or attributes changed, refit
-      for (const m of muts){
-        if (m.type === 'childList' || m.type === 'attributes'){
-          burstRefit();
-          break;
+  const originalRenderPage = window.renderPage;
+    window.renderPage = async function(...args) {
+        if (typeof originalRenderPage === 'function') {
+            await originalRenderPage.apply(this, args);
         }
-      }
+        burstRefit();
+    };
+
+  const outEl = document.getElementById('outputContainer');
+  if (outEl && 'MutationObserver' in window) {
+    const mo = new MutationObserver(() => {
+      const z = window.getPDFZoom();
+      if (z.mode !== 'custom') burstRefit();
     });
-    mo.observe(out, { childList: true, subtree: true, attributes: true });
+    mo.observe(outEl, { childList: true, subtree: true, attributes: true });
   }
 
-  // Also refit when the wrapper size changes
-  const wrap = document.getElementById('viewportWrapper') || document.getElementById('viewport');
-  if (wrap && 'ResizeObserver' in window){
-    const ro = new ResizeObserver(() => burstRefit());
-    ro.observe(wrap);
+  const wrapEl = document.getElementById('viewportWrapper');
+  if (wrapEl && 'ResizeObserver' in window) {
+    const ro = new ResizeObserver(burstRefit);
+    ro.observe(wrapEl);
   } else {
     window.addEventListener('resize', burstRefit);
   }
 
-  // Global hook to call after a file finishes loading
-  window.onPDFFileLoaded = function(){
-    if (typeof window.fitPage === 'function') window.fitPage();
-    burstRefit();
-  };
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', window.onPDFFileLoaded);
+  } else {
+    window.onPDFFileLoaded();
+  }
 })();
 </script>
 </body>
