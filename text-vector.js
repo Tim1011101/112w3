@@ -191,11 +191,22 @@
         tokens.push({ type: "array", value: arrStr.trim() });
         continue;
       }
+      if (input[i] === '<' && input[i + 1] !== '<') {
+        let hex = "";
+        i++;
+        while (i < input.length && input[i] !== '>') {
+          hex += input[i];
+          i++;
+        }
+        if (i < input.length && input[i] === '>') i++;
+        tokens.push({ type: "hexstring", value: "<" + hex + ">" });
+        continue;
+      }
       let token = "";
       while (i < input.length && !/\s/.test(input[i]) &&
         input[i] !== '(' && input[i] !== '[' && input[i] !== ')') {
         token += input[i];
-      i++;
+        i++;
         }
         if (!isNaN(token)) tokens.push({ type: "number", value: parseFloat(token) });
         else tokens.push({ type: "operator", value: token });
@@ -508,13 +519,15 @@
           }
 
           if (token.type === "operator" && token.value === "Tj") {
-            if (i >= 1 && tokens[i-1].type === "string") {
-              let txt = tokens[i-1].value;
+            if (i >= 1 && (tokens[i-1].type === "string" || tokens[i-1].type === "hexstring")) {
+              let txt = tokens[i-1].type === "hexstring"
+                ? decodeHexString(tokens[i-1].value, fontCache.get(currentFont))
+                : tokens[i-1].value;
               let effective = multiplyMatrix(globalTransform, textTransform);
               let tx = effective[4],
-              ty = effective[5],
-              a = effective[0],
-              b = effective[1];
+                ty = effective[5],
+                a = effective[0],
+                b = effective[1];
               let scale = Math.hypot(a, b) || 1;
               let angleDeg = -Math.atan2(b, a) * 180 / Math.PI;
               let svgY = currentLayer.pdfYToSvgY(ty);
@@ -543,19 +556,23 @@
               let angleDeg = -Math.atan2(b, a) * 180 / Math.PI;
               let svgY = currentLayer.pdfYToSvgY(ty);
               const arrContent = tokens[i-1].value;
-              const regex = /(\([^\)]*(?:\\\)[^\)]*)*\))|([-+]?\d+(\.\d+)?)/g;
+              const regex = /(\([^\)]*(?:\\\)[^\)]*)*\))|(<[^>]+>)|([-+]?\d+(\.\d+)?)/g;
               let match, segments = [];
               let currentDx = 0;
               while ((match = regex.exec(arrContent)) !== null) {
                 if (match[1]) {
                   let txt = match[1].slice(1, -1);
                   txt = txt.replace(/\\\(/g, "(")
-                  .replace(/\\\)/g, ")")
-                  .replace(/\\\\/g, "\\");
+                    .replace(/\\\)/g, ")")
+                    .replace(/\\\\/g, "\\");
                   segments.push({ text: txt, dx: currentDx });
                   currentDx = 0;
                 } else if (match[2]) {
-                  let adjustment = parseFloat(match[2]);
+                  let txt = decodeHexString(match[2], fontCache.get(currentFont));
+                  segments.push({ text: txt, dx: currentDx });
+                  currentDx = 0;
+                } else if (match[3]) {
+                  let adjustment = parseFloat(match[3]);
                   let dxShift = -(adjustment / 1000) * currentFontSize * scale;
                   currentDx += dxShift;
                 }
@@ -592,13 +609,15 @@
           if (token.type === "operator" && token.value === "'") {
             textTransform[4] = initialTextOrigin[0];
             textTransform[5] = initialTextOrigin[1] - currentFontSize;
-            if (i >= 1 && tokens[i-1].type === "string") {
-              let txt = tokens[i-1].value;
+            if (i >= 1 && (tokens[i-1].type === "string" || tokens[i-1].type === "hexstring")) {
+              let txt = tokens[i-1].type === "hexstring"
+                ? decodeHexString(tokens[i-1].value, fontCache.get(currentFont))
+                : tokens[i-1].value;
               let effective = multiplyMatrix(globalTransform, textTransform);
               let tx = effective[4],
-              ty = effective[5],
-              a = effective[0],
-              b = effective[1];
+                ty = effective[5],
+                a = effective[0],
+                b = effective[1];
               let scale = Math.hypot(a, b) || 1;
               let angleDeg = -Math.atan2(b, a) * 180 / Math.PI;
               let svgY = currentLayer.pdfYToSvgY(ty);
@@ -692,18 +711,20 @@
       return '#000'; // fallback
     }
 
-    function renderText(ctx, font, hexStr, x, y, color) {
-      // Convert hex like <0053>
+    function decodeHexString(hexStr, font) {
       const bytes = [];
-      for (let i = 1; i < hexStr.length - 1; i += 2)
-        bytes.push(parseInt(hexStr.substr(i,2),16));
-
+      for (let i = 1; i < hexStr.length - 1; i += 2) {
+        bytes.push(parseInt(hexStr.substr(i, 2), 16));
+      }
       let text = '';
       for (let b of bytes) {
-        const mapped = font.encodingMap?.[b] || String.fromCharCode(b);
-        text += mapped;
+        text += font?.encodingMap?.[b] || String.fromCharCode(b);
       }
+      return text;
+    }
 
+    function renderText(ctx, font, hexStr, x, y, color) {
+      const text = decodeHexString(hexStr, font);
       const t = document.createElementNS("http://www.w3.org/2000/svg", "text");
       t.setAttribute("x", x);
       t.setAttribute("y", y);
