@@ -153,10 +153,13 @@ function initPDFExplorer() {
 function extractTopLevelDict(bodyStr) {
   // Normalize malformed brackets and extra closing brackets
   let normalizedStr = bodyStr
-    .replace(/<\s*(\d+\s+\d+\s+R\s*)>>>/g, '<< $1 >>') // Fix < 4 0 R>>> to << 4 0 R >>
-    .replace(/<\s*(\d+\s+\d+\s+R\s*)>>>>/g, '<< $1 >>') // Fix < 4 0 R>>>> to << 4 0 R >>
-    .replace(/<\s*(\[.*?\]\s*)>>/g, '<< $1 >>') // Fix <[2 0 R]>> to << [2 0 R] >>
-    .replace(/\/Font\s*<\s*(\d+\s+\d+\s+R\s*)>>>>/g, '/Font << /F1 $1 >>'); // Fix /Font < 4 0 R>>>> to /Font << /F1 4 0 R >>
+    // Remove stray wrappers like '< 4 0 R>>' or '< 4 0 R>>>>'
+    .replace(/<\s*(\d+\s+\d+\s+R\s*)>+/g, '$1')
+    // Handle cases like '<[2 0 R]>>' with array references
+    .replace(/<\s*(\[[^>]*?\]\s*)>+/g, '$1');
+
+  if (!/^\s*<</.test(normalizedStr)) normalizedStr = '<< ' + normalizedStr;
+  if (!/>>\s*$/.test(normalizedStr)) normalizedStr = normalizedStr + ' >>';
 
   const start = normalizedStr.indexOf('<<');
   if (start === -1) {
