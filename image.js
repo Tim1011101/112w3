@@ -69,6 +69,15 @@
     const m = src.match(new RegExp(`/${key}\\s+(-?\\d+(?:\\.\\d+)?)\\b`));
     return m ? +m[1] : null;
   }
+  function parseNumberArray(src, key) {
+    const m = src.match(new RegExp(`/${key}\\s*\\[([^\\]]+)\\]`));
+    if (!m) return null;
+    const out = [];
+    const re = /-?\\d+(?:\\.\\d+)?/g;
+    let mm;
+    while ((mm = re.exec(m[1]))) out.push(+mm[0]);
+    return out;
+  }
 
   // ---------- content tokenizer (q/Q/cm/Do + BI/ID/EI) ----------
   function tokenizeContent(content) {
@@ -175,8 +184,20 @@
     // Width/Height. Parse them if present, but guard against missing or
     // non-positive values. If either dimension is not a valid positive number,
     // we return null to skip decoding rather than throwing a DOMException.
-    const W   = parseNumber(dictStr, 'Width')  || parseNumber(dictStr, 'W');
-    const H   = parseNumber(dictStr, 'Height') || parseNumber(dictStr, 'H');
+    let W   = parseNumber(dictStr, 'Width')  || parseNumber(dictStr, 'W');
+    let H   = parseNumber(dictStr, 'Height') || parseNumber(dictStr, 'H');
+
+    // Some XObjects, especially /Subtype /Form used for transparency groups,
+    // omit explicit Width/Height but provide a /BBox instead. Use it as a
+    // fallback to derive image dimensions so the object can still be rendered.
+    if ((typeof W !== 'number' || W <= 0 || typeof H !== 'number' || H <= 0)) {
+      const bbox = /\/Subtype\s*\/Form\b/.test(dictStr) ? parseNumberArray(dictStr, 'BBox') : null;
+      if (bbox && bbox.length === 4) {
+        W = bbox[2] - bbox[0];
+        H = bbox[3] - bbox[1];
+      }
+    }
+
     if (typeof W !== 'number' || W <= 0 || typeof H !== 'number' || H <= 0) {
       // Log a warning for debugging but do not attempt to decode the image. Some
       // XObjects specify only a bounding box and are not meant to be treated
