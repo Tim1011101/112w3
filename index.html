@@ -1,0 +1,1396 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>PDF Explorer -- Pages & Root (Vector Renderer)</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  :root { color-scheme: light dark; }
+  body { margin: 0; padding: 1rem; font: 16px/1.5 system-ui, Segoe UI, Arial, sans-serif; background-color: #f9fafb; color: #111827; }
+  @media (prefers-color-scheme: dark) {
+    body { background-color: #111827; color: #e5e7eb; }
+  }
+  header { display: flex; flex-wrap: wrap; gap: .75rem; margin-bottom: 1rem; align-items: center; }
+  label { display: flex; align-items: center; gap: .5rem; font-weight: 600; }
+  input[type="file"], select, button {
+    font-size: 1rem; padding: .35rem .6rem; border-radius: 0.375rem; border: 1px solid #d1d5db; background: #fff; color: #111827;
+  }
+  select { min-width: 16ch; }
+  button { cursor: pointer; background-color: #3b82f6; color: white; border-color: #3b82f6; transition: background-color 0.2s; font-weight: 600; }
+  button:hover { background-color: #2563eb; }
+  button:disabled { opacity: .6; cursor: not-allowed; background-color: #9ca3af; border-color: #9ca3af; }
+  @media (prefers-color-scheme: dark) {
+    input[type="file"], select { background-color: #374151; color: #e5e7eb; border-color: #4b5563; }
+    button { background-color: #3b82f6; border-color: #3b82f6; }
+    button:hover { background-color: #2563eb; }
+    button:disabled { background-color: #4b5563; border-color: #4b5563; }
+  }
+
+  #viewportWrapper {
+    width: 100vw;
+    height: 70vh;
+    overflow: hidden;
+    position: relative;
+    border: 2px solid #666;
+    background: #fff;
+    margin-bottom: 10px;
+  }
+  @media (prefers-color-scheme: dark) {
+    #viewportWrapper { background: #0b0b0b; border-color: #444; }
+  }
+  #outputContainer {
+    position: absolute;
+    transform-origin: top left;
+  }
+  .layer {
+    position: absolute;
+    top: 0; left: 0;
+    width: 100%; height: 100%;
+    pointer-events: none;
+  }
+  .layer svg {
+    position: absolute;
+    top: 0; left: 0;
+    width: 100%; height: 100%;
+  }
+  .layer svg text {
+    pointer-events: auto;
+    user-select: text;
+    cursor: text;
+  }
+
+  #out {
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    border: 1px solid #d1d5db;
+    border-radius: .5rem;
+    padding: 1rem;
+    overflow: auto;
+    max-height: 75vh;
+    background: #ffffff;
+    color: #111827;
+    box-shadow: 0 1px 3px 0 rgb(0 0 0 / 0.1), 0 1px 2px -1px rgb(0 0 0 / 0.1);
+  }
+  @media (prefers-color-scheme: dark) {
+    #out { background: #1f2937; border-color: #4b5563; color: #d1d5db; }
+  }
+
+  a.ref { color: #2563eb; text-decoration: underline; cursor: pointer; font-weight: bold; }
+  @media (prefers-color-scheme: dark) {
+    a.ref { color: #60a5fa; }
+  }
+  .debug-info {
+    background: #fef3c7;
+    border: 1px solid #f59e0b;
+    padding: 0.5rem;
+    margin: 0.5rem 0;
+    border-radius: 0.375rem;
+    font-size: 0.875rem;
+    color: #7c2d12;
+  }
+  @media (prefers-color-scheme: dark) {
+    .debug-info { background: #451a03; border-color: #d97706; color: #fbbf24; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <label>PDF file:
+    <input type="file" id="file" accept=".pdf">
+  </label>
+  <label>Page:
+    <select id="pageSel" disabled></select>
+  </label>
+  <button id="rootBtn" disabled>Show /Root</button>
+  <button id="debugBtn">Debug Info</button>
+</header>
+
+<div id="viewportWrapper">
+  <div id="outputContainer"></div>
+</div>
+
+<div id="out">Pick a PDF file…</div>
+<div style="position:fixed; right:12px; top:12px; z-index:9999; display:flex; gap:6px;">
+  <button onclick="fitPage()">Fit page</button>
+  <button onclick="fitWidth()">Fit width</button>
+  <button onclick="fitHeight()">Fit height</button>
+  <button onclick="zoomTo(getPDFZoom().value ? getPDFZoom().value*1.1 : 1.1)">+</button>
+  <button onclick="zoomTo(getPDFZoom().value ? getPDFZoom().value/1.1 : 0.9)">−</button>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/fflate"></script>
+
+<script>
+// Global definition to ensure availability in all scopes.
+if (typeof window.collectIndirectObjects !== 'function') {
+  window.collectIndirectObjects = function(txt) {
+    const re = /(\d+)\s+(\d+)\s+obj\b([\s\S]*?)\bendobj/gm;
+    let m;
+    while ((m = re.exec(txt))) {
+      const num = parseInt(m[1], 10);
+      const gen = parseInt(m[2], 10);
+      const body = (m[3] || '').trim();
+      // 'store' lives inside initPDFExplorer; if not available yet, stash
+      // results on window and let initPDFExplorer import them.
+      if (typeof store === 'function') {
+        store(num, gen, body);
+      } else {
+        (window.__pendingPdfObjects ||= []).push([num, gen, body]);
+      }
+    }
+  };
+  // Helper that initPDFExplorer can call to import any pending objects
+  window.__flushPendingPdfObjects = function(storeFn) {
+    const list = window.__pendingPdfObjects || [];
+    for (const [n,g,b] of list) storeFn(n,g,b);
+    window.__pendingPdfObjects = [];
+  };
+}
+</script>
+<script>
+function initPDFExplorer() {
+  
+  // === Performance utilities ===
+  const __perf = { log: [], spans: new Map(), sections: [] };
+  function mark(label) {
+    const t = performance.now();
+    __perf.log.push({ label, t });
+    try { console.log(`[Perf] ${label} @ ${t.toFixed(2)}ms`); } catch {}
+  }
+  function spanStart(label) {
+    __perf.spans.set(label, performance.now());
+  }
+  function spanEnd(label) {
+    const t0 = __perf.spans.get(label);
+    if (t0 != null) {
+      const dt = performance.now() - t0;
+      __perf.sections.push({ label, ms: dt });
+      __perf.spans.delete(label);
+      try { console.log(`[Perf] ${label} took ${dt.toFixed(2)}ms`); } catch {}
+      return dt;
+    }
+    return 0;
+  }
+  
+  // Make performance functions globally accessible
+  window.spanStart = spanStart;
+  window.spanEnd = spanEnd;
+  function showPerfSummary() {
+    console.log("=== Performance Summary ===");
+    for (let i = 1; i < __perf.log.length; i++) {
+      const prev = __perf.log[i-1], cur = __perf.log[i];
+      console.log(`${cur.label} took ${(cur.t - prev.t).toFixed(2)}ms`);
+    }
+    if (__perf.log.length > 1) {
+      const total = __perf.log[__perf.log.length-1].t - __perf.log[0].t;
+      console.log(`TOTAL: ${total.toFixed(2)}ms`);
+    }
+    if (__perf.sections.length) {
+      const sorted = __perf.sections.slice().sort((a,b)=>b.ms-a.ms).slice(0,10);
+      console.log("--- Slowest sections ---");
+      for (const s of sorted) console.log(`${s.label}: ${s.ms.toFixed(2)}ms`);
+    }
+  }
+const $file = document.getElementById('file');
+  const $pages = document.getElementById('pageSel');
+  const $rootBtn = document.getElementById('rootBtn');
+  const $debugBtn = document.getElementById('debugBtn');
+  const $out = document.getElementById('out');
+
+  const objects = new Map();
+  const pages = [];
+  const fontCache = new Map();
+  let rootKey = '';
+  let debugInfo = [];
+  const xrefEntries = new Map();
+  let fileBytes = null;
+  let fileText = '';
+
+  const LF = 10, CR = 13, SPACE = 32;
+  const ENDOBJ_BYTES = new TextEncoder().encode("endobj");
+  const STREAM_BYTES = new TextEncoder().encode("stream");
+  const ENDSTREAM_BYTES = new TextEncoder().encode("endstream");
+
+  function reset() {
+    objects.clear(); pages.length = 0; fontCache.clear(); rootKey = ''; debugInfo = []; xrefEntries.clear();
+    fileBytes = null; fileText = '';
+    $pages.innerHTML = ''; $pages.disabled = true;
+    $rootBtn.disabled = true; $out.textContent = 'Pick a PDF file...';
+    document.getElementById('outputContainer').innerHTML = '';
+  }
+
+function extractTopLevelDict(bodyStr) {
+  // 1) Trim early; it helps later heuristics.
+  let s = (bodyStr || '').trim();
+
+  // 2) Remove stray angle brackets wrapping refs/arrays like "<3 0 R", "<[2 0 R]>"
+  // s = s
+  //   .replace(/<\s*(\d+\s+\d+\s+R)\s*>+/g, '$1')         // < 3 0 R >  -> 3 0 R
+  //   .replace(/<\s*(\[[^\]]*?\])\s*>+/g, '$1');          // < [ ... ] > -> [ ... ]
+
+  // 3) If a ref is immediately followed by a name, add a space: "R/Font" -> "R /Font"
+  // s = s.replace(/(\d+\s+\d+\s+R)(?=\/)/g, '$1 ');
+
+  // 4) If a name is immediately followed by a ref, add a space: "/Contents5 0 R" -> "/Contents 5 0 R"
+  // s = s.replace(/\/([A-Za-z0-9\-\+]+)(?=\s*\d+\s+\d+\s+R)/g, '/$1 ');
+
+  // 5) Ensure a space before each new name if it’s jammed into prior token: "...R/Parent" -> "...R /Parent"
+  // s = s.replace(/([^<>\s])\/([A-Za-z])/g, '$1 /$2');
+
+  // 6) Collapse silly ">>>>" runs that sometimes appear after cleanup
+  // s = s.replace(/>>{3,}/g, '>>');
+
+  // 7) If someone wrote "/Font < 4 0 R >>>>", normalize that too
+  // s = s.replace(/\/(\w+)\s*<\s*(\d+\s+\d+\s+R)\s*>+/g, '/$1 $2');
+
+  // 8) If there are accidental extra angle brackets still hugging refs, remove them
+  // s = s.replace(/[<>]+(\d+\s+\d+\s+R)[<>]*/g, '$1');
+
+  // 9) Guarantee we have a dictionary wrapper. If one already exists, find balanced "<<" ... ">>".
+  //    Otherwise, wrap the whole normalized string in "<< >>".
+  let start = s.indexOf('<<');
+  if (start === -1) {
+    // No obvious dict delimiters; wrap the normalized content.
+    s = `<< ${s.trim()} >>`;
+    start = 0;
+  }
+
+  // Walk to find the matching ">>" while respecting strings/hex strings.
+  let nest = 0;
+  let inLiteral = false, inHex = false, paren = 0, escaped = false;
+  for (let i = start; i < s.length; i++) {
+    const ch = s[i], nx = i + 1 < s.length ? s[i + 1] : '';
+
+    if (escaped) { escaped = false; continue; }
+
+    if (inLiteral) {
+      if (ch === '\\') { escaped = true; continue; }
+      if (ch === '(') paren++;
+      else if (ch === ')') { if (paren > 0) paren--; else inLiteral = false; }
+      continue;
+    }
+
+    if (inHex) { if (ch === '>') inHex = false; continue; }
+
+    if (ch === '<') {
+      if (nx === '<') { nest++; i++; } // Increment nest for '<<'
+      else { inHex = true; }
+    } else if (ch === '>') {
+      if (nx === '>') {
+        if (nest > 0) { // Only decrement if we're in a nested dict
+          nest--; i++;
+        }
+        if (nest === 0) {
+          // Return the balanced dictionary slice.
+          return s.substring(start, i + 1);
+        }
+      }
+    } else if (ch === '(') {
+      inLiteral = true; paren = 0;
+    }
+  }
+
+  // If we arrive here, the dict wasn’t closed properly. Close it.
+  return s.substring(start) + ' >>';
+}
+
+
+  function store(num, gen, body) {
+    const key = `${num} ${gen}`;
+    if (objects.has(key)) return;
+    const dict = extractTopLevelDict(body);
+    objects.set(key, { num, gen, dict, raw: body, stream: '', decoded: '', streamError: '', streamInfo: '', processed: false });
+  }
+
+  function findKeywordBytes(data, keywordBytes, start = 0) {
+    const searchEnd = data.length - keywordBytes.length;
+    for (let i = start; i <= searchEnd; i++) {
+      let ok = true;
+      for (let j = 0; j < keywordBytes.length; j++) {
+        if (data[i + j] !== keywordBytes[j]) { ok = false; break; }
+      }
+      if (ok) return i;
+    }
+    return -1;
+  }
+
+  function extractDictAndStreamBoundsRough(objectBytes, globalStartOffset) {
+    if (!objectBytes || objectBytes.length === 0) return { dictStr: null, streamStartOffset: -1, streamEndOffset: -1 };
+
+    let dictStart = -1;
+    for (let i = 0; i < objectBytes.length - 1; i++) {
+      if (objectBytes[i] === 60 && objectBytes[i + 1] === 60) { dictStart = i; break; }
+    }
+    if (dictStart === -1) return { dictStr: null, streamStartOffset: -1, streamEndOffset: -1 };
+
+    let dictEnd = -1;
+    let nestingLevel = 0;
+    let inLiteralString = false;
+    let inHexString = false;
+    let parenNesting = 0;
+
+    for (let i = dictStart; i < objectBytes.length; i++) {
+        const b = objectBytes[i];
+        if (inLiteralString) {
+            if (b === 92) { i++; continue; }
+            if (b === 40) { parenNesting++; }
+            else if (b === 41) {
+                if (parenNesting > 0) parenNesting--;
+                else inLiteralString = false;
+            }
+            continue;
+        }
+        if (inHexString) {
+            if (b === 62) inHexString = false;
+            continue;
+        }
+        if (b === 60) {
+            if (i + 1 < objectBytes.length && objectBytes[i+1] === 60) {
+                nestingLevel++;
+                i++;
+            } else {
+                inHexString = true;
+            }
+        } else if (b === 62) {
+            if (i + 1 < objectBytes.length && objectBytes[i+1] === 62) {
+                nestingLevel--;
+                i++;
+                if (nestingLevel === 0) {
+                    dictEnd = i + 1;
+                    break;
+                }
+            }
+        } else if (b === 40) {
+            inLiteralString = true;
+            parenNesting = 0;
+        }
+    }
+
+    if (dictEnd === -1) return { dictStr: null, streamStartOffset: -1, streamEndOffset: -1 };
+
+    const dictStr = new TextDecoder('latin1').decode(objectBytes.slice(dictStart, dictEnd));
+    const streamKeywordOffsetRel = findKeywordBytes(objectBytes, STREAM_BYTES, dictEnd);
+    if (streamKeywordOffsetRel === -1) return { dictStr, streamStartOffset: -1, streamEndOffset: -1 };
+
+    let streamStartOffsetRel = streamKeywordOffsetRel + STREAM_BYTES.length;
+    while (streamStartOffsetRel < objectBytes.length) {
+      const byte = objectBytes[streamStartOffsetRel];
+      if (byte === CR || byte === LF || byte === SPACE) streamStartOffsetRel++;
+      else break;
+    }
+    if (streamStartOffsetRel >= objectBytes.length) return { dictStr, streamStartOffset: -1, streamEndOffset: -1 };
+
+    const endStreamKeywordOffsetRel = findKeywordBytes(objectBytes, ENDSTREAM_BYTES, streamStartOffsetRel);
+    if (endStreamKeywordOffsetRel === -1) return { dictStr, streamStartOffset: globalStartOffset + streamStartOffsetRel, streamEndOffset: -1 };
+
+    let streamEndOffsetRel = endStreamKeywordOffsetRel;
+    while (streamEndOffsetRel > streamStartOffsetRel) {
+      const byte = objectBytes[streamEndOffsetRel - 1];
+      if (byte === CR || byte === LF || byte === SPACE) streamEndOffsetRel--;
+      else break;
+    }
+    return {
+      dictStr,
+      streamStartOffset: globalStartOffset + streamStartOffsetRel,
+      streamEndOffset: globalStartOffset + streamEndOffsetRel
+    };
+  }
+
+  function resolveIndirectLength(txt, objNum, genNum) {
+    const re = new RegExp(`\\b${objNum}\\s+${genNum}\\s+obj\\b([\\s\\S]*?)endobj`, 'm');
+    const m = txt.match(re);
+    if (!m) return -1;
+    const body = m[1].trim();
+    const num = parseInt(body, 10);
+    return isNaN(num) ? -1 : num;
+  }
+
+  function parseFilters(dictStr) {
+    const single = dictStr.match(/\/Filter\s*\/([A-Za-z0-9]+)\b/);
+    if (single) return [single[1]];
+    const arr = dictStr.match(/\/Filter\s*\[([^\]]*)\]/);
+    if (!arr) return [];
+    const names = [];
+    const re = /\/([A-Za-z0-9]+)\b/g;
+    let m;
+    while ((m = re.exec(arr[1]))) names.push(m[1]);
+    return names;
+  }
+
+  async function extractAndDecodeStream(obj, bytes, txt) {
+    
+    spanStart(`extractAndDecodeStream ${obj.num} ${obj.gen}`);
+    const { raw } = obj;
+    const si = raw.indexOf('stream');
+    if (si === -1) {
+      obj.streamError = 'No stream keyword found';
+      spanEnd(`extractAndDecodeStream ${obj.num} ${obj.gen}`);
+      return;
+    }
+    const objHeader = `${obj.num} ${obj.gen} obj`;
+    const objStartOffset = txt.indexOf(objHeader);
+    if (objStartOffset === -1) {
+      obj.streamError = 'Could not find object start in file text.';
+      return;
+    }
+    const objEndOffset = txt.indexOf('endobj', objStartOffset);
+    const objBytes = bytes.slice(objStartOffset, objEndOffset + 6);
+    const { dictStr, streamStartOffset, streamEndOffset } = extractDictAndStreamBoundsRough(objBytes, objStartOffset);
+    if (!dictStr) {
+      obj.streamError = 'Could not extract dictionary or stream boundaries.';
+      return;
+    }
+    const flateFilter = /\/Filter\s*\/FlateDecode\b/.test(dictStr);
+    obj.streamInfo = `Filter: ${flateFilter ? 'FlateDecode' : 'None'}`;
+    const lengthMatch = dictStr.match(/\/Length\s*(?:(\d+)\s+(\d+)\s+R|(\d+))/);
+    let officialLength = -1;
+    if (lengthMatch) {
+      if (lengthMatch[1] && lengthMatch[2]) {
+        officialLength = resolveIndirectLength(txt, +lengthMatch[1], +lengthMatch[2]);
+        obj.streamInfo += `, Length: Indirect -> ${officialLength}`;
+      } else {
+        officialLength = parseInt(lengthMatch[3], 10);
+        obj.streamInfo += `, Length: Direct -> ${officialLength}`;
+      }
+    }
+    if (streamStartOffset === -1) {
+      obj.streamError = 'Could not determine stream start offset.';
+      return;
+    }
+    const start = streamStartOffset;
+    const end = officialLength >= 0 ? Math.min(start + officialLength, bytes.length) : streamEndOffset;
+    if (!(end > start)) {
+      obj.streamError = `Invalid stream bounds (start: ${start}, end: ${end}).`;
+      return;
+    }
+    const streamBytes = bytes.slice(start, end);
+    obj.stream = new TextDecoder('latin1').decode(streamBytes);
+    if (flateFilter) {
+      try {
+        spanStart(`FlateDecode ${obj.num} ${obj.gen}`);
+        const decodedBytes = fflate.unzlibSync(streamBytes);
+        spanEnd(`FlateDecode ${obj.num} ${obj.gen}`);
+        obj.decoded = new TextDecoder('latin1').decode(decodedBytes);
+        obj.streamInfo += `, Flate decompressed successfully (${decodedBytes.length} bytes)`;
+      } catch (err) {
+        obj.streamError = `Flate decompression failed: ${err.message}`;
+      }
+    } else {
+      obj.decoded = obj.stream;
+      obj.streamInfo += `, Raw stream used as is`;
+    }
+    
+    spanEnd(`extractAndDecodeStream ${obj.num} ${obj.gen}`);
+  }
+
+  function checkEncryption(txt) {
+    return /\/Encrypt\b/.test(txt);
+  }
+
+  async function expandObjStm(obj) {
+    if (!/\/ObjStm\b/.test(obj.dict || '')) return;
+    if (!obj.decoded) { debugInfo.push(`[expandObjStm] No decoded stream for /ObjStm ${obj.num} ${obj.gen}`); return; }
+    const N_match = obj.dict.match(/\/N\s+(\d+)/);
+    const F_match = obj.dict.match(/\/First\s+(\d+)/);
+    const N = N_match ? +N_match[1] : 0;
+    const F = F_match ? +F_match[1] : 0;
+    if (!N || !F) { debugInfo.push(`[expandObjStm] Missing /N or /First in ${obj.num} ${obj.gen}`); return; }
+    const headerStr = obj.decoded.slice(0, F).trim();
+    const header = headerStr.split(/\s+/).map(Number);
+    if (header.length < N * 2) { debugInfo.push(`[expandObjStm] Header length mismatch in ${obj.num} ${obj.gen}`); return; }
+    let extractedCount = 0;
+    for (let i = 0; i < N; i++) {
+      const num = header[2 * i];
+      const off = header[2 * i + 1];
+      const start = F + off;
+      const end = (i === N - 1) ? obj.decoded.length : F + header[2 * (i + 1) + 1];
+      if (isNaN(num) || isNaN(off) || start > obj.decoded.length || start > end) continue;
+      const body = obj.decoded.slice(start, end).trim();
+      if (body) { store(num, 0, body); extractedCount++; }
+    }
+    debugInfo.push(`[expandObjStm] Expanded /ObjStm ${obj.num} ${obj.gen}: extracted ${extractedCount} of ${N} objects`);
+  }
+
+  async function processObjStmIfNeeded(objNum, gen) {
+    const entry = xrefEntries.get(objNum);
+    if (!entry || entry.type !== 'compressed') return;
+    const objStmKey = `${entry.objStm} 0`;
+    const objStm = objects.get(objStmKey);
+    if (!objStm) { debugInfo.push(`[LazyLoad] /ObjStm ${objStmKey} not found for obj ${objNum} ${gen}`); return; }
+    if (objStm.processed) return;
+    debugInfo.push(`[LazyLoad] Decompressing /ObjStm ${objStmKey} for obj ${objNum} ${gen}`);
+    spanStart(`ObjStm decode ${objStm.num} ${objStm.gen}`);
+    await extractAndDecodeStream(objStm, fileBytes, fileText);
+    spanEnd(`ObjStm decode ${objStm.num} ${objStm.gen}`);
+    objStm.processed = true;
+    if (objStm.decoded) {
+      debugInfo.push(`[LazyLoad] /ObjStm ${objStmKey} decoded, expanding objects.`);
+      spanStart(`ObjStm expand ${objStm.num} ${objStm.gen}`);
+      await expandObjStm(objStm);
+      spanEnd(`ObjStm expand ${objStm.num} ${objStm.gen}`);
+    } else {
+      debugInfo.push(`[LazyLoad] Failed to decode /ObjStm ${objStmKey}: ${objStm.streamError || 'No decoded stream'}`);
+    }
+  }
+
+  function readBytes(bytes, start, length) {
+    let val = 0;
+    for (let i = 0; i < length; i++) val = (val << 8) | bytes[start + i];
+    return val;
+  }
+
+  function parseTraditionalXref(xrefText) {
+    const lines = xrefText.split(/\r?\n/);
+    let i = 0;
+    while (i < lines.length) {
+      const line = lines[i].trim();
+      if (line === 'xref') { i++; continue; }
+      const subsectionMatch = line.match(/^(\d+)\s+(\d+)$/);
+      if (subsectionMatch) {
+        const firstObj = parseInt(subsectionMatch[1], 10);
+        const numObjs = parseInt(subsectionMatch[2], 10);
+        for (let j = 0; j < numObjs; j++) {
+          i++;
+          const entryLine = lines[i]?.trim();
+          if (!entryLine) continue;
+          const entryMatch = entryLine.match(/^(\d{10}) (\d{5}) ([fn])$/);
+          if (entryMatch) {
+            const offset = parseInt(entryMatch[1], 10);
+            const gen = parseInt(entryMatch[2], 10);
+            const status = entryMatch[3];
+            const objNum = firstObj + j;
+            if (status === 'f') xrefEntries.set(objNum, { type: 'free', nextFree: offset, gen });
+            else if (status === 'n') xrefEntries.set(objNum, { type: 'in-use', offset, gen });
+          }
+        }
+      }
+      i++;
+    }
+    debugInfo.push(`Parsed ${xrefEntries.size} entries from traditional xref table`);
+  }
+
+function normalizeMalformedDict(bodyStr) {
+  let s = (bodyStr || '').trim();
+
+  // Remove stray angle brackets around refs/arrays
+  // s = s
+  //   .replace(/<\s*(\d+\s+\d+\s+R)\s*>+/g, '$1')
+  //   .replace(/<\s*(\[[^\]]*?\])\s*>+/g, '$1');
+
+  // Space between "R" and next name: "5 0 R/Font" -> "5 0 R /Font"
+  // s = s.replace(/(\d+\s+\d+\s+R)(?=\/)/g, '$1 ');
+
+  // Space between name and ref: "/Contents5 0 R" -> "/Contents 5 0 R"
+  // s = s.replace(/\/([A-Za-z0-9\-\+]+)(?=\s*\d+\s+\d+\s+R)/g, '/$1 ');
+
+  // Add a space when a name is jammed onto prior token: "...R/Parent" -> "...R /Parent"
+  // s = s.replace(/([^<>\s])\/([A-Za-z])/g, '$1 /$2');
+
+  // Cases like "/Font <4 0 R>>>>" -> "/Font 4 0 R"
+  // s = s.replace(/\/(\w+)\s*<\s*(\d+\s+\d+\s+R)\s*>+/g, '/$1 $2');
+
+  // Collapse overlong closers
+  // s = s.replace(/>>{3,}/g, '>>');
+
+  // Ensure it's wrapped as a dictionary
+  // if (!/<<[\s\S]*>>/.test(s)) s = `<< ${s.trim()} >>`;
+  return s;
+}
+
+
+  function parseXrefStream(xrefStreamObj) {
+    if (!xrefStreamObj.decoded) {
+      debugInfo.push(`Cannot parse XRef stream ${xrefStreamObj.num} ${xrefStreamObj.gen}: not decoded.`);
+      return;
+    }
+    const dict = xrefStreamObj.dict;
+    const wMatch = dict.match(/\/W\s*\[\s*(\d+)\s+(\d+)\s+(\d+)\s*\]/);
+    const indexMatch = dict.match(/\/Index\s*\[([^\]]*)\]/);
+    const sizeMatch = dict.match(/\/Size\s+(\d+)/);
+    if (!wMatch) { debugInfo.push(`XRef stream ${xrefStreamObj.num} ${xrefStreamObj.gen} missing /W field.`); return; }
+    const W = wMatch.slice(1, 4).map(Number);
+    const Index = indexMatch ? indexMatch[1].trim().split(/\s+/).map(Number).filter(n => !isNaN(n)) : [0, sizeMatch ? parseInt(sizeMatch[1]) : 0];
+    const data = new Uint8Array(xrefStreamObj.decoded.length);
+    for (let i = 0; i < xrefStreamObj.decoded.length; i++) data[i] = xrefStreamObj.decoded.charCodeAt(i);
+    const [w0, w1, w2] = W;
+    const entrySize = w0 + w1 + w2;
+    let byteIdx = 0;
+    for (let i = 0; i < Index.length; i += 2) {
+      const startObj = Index[i];
+      const count = Index[i + 1];
+      for (let j = 0; j < count; j++) {
+        if (byteIdx + entrySize > data.length) break;
+        const type = w0 ? readBytes(data, byteIdx, w0) : 1;
+        const field1 = readBytes(data, byteIdx + w0, w1);
+        const field2 = readBytes(data, byteIdx + w0 + w1, w2);
+        byteIdx += entrySize;
+        const objNum = startObj + j;
+        if (type === 0) xrefEntries.set(objNum, { type: 'free', nextFree: field1, gen: field2 });
+        else if (type === 1) xrefEntries.set(objNum, { type: 'in-use', offset: field1, gen: field2 });
+        else if (type === 2) xrefEntries.set(objNum, { type: 'compressed', objStm: field1, index: field2 });
+      }
+    }
+    debugInfo.push(`Parsed ${xrefEntries.size} entries from XRef stream ${xrefStreamObj.num} ${xrefStreamObj.gen}`);
+  }
+function cssEscape(a){return a.replace(/(['"\\])/g,'\\$1');}
+function base64FromLatin1(s){ return btoa(s); }
+
+function parseToUnicodeCMap(cmapText){
+  // Determine bytes-per-char from codespace ranges (default 1)
+  let bytesPerChar = 1;
+  const csr = /begincodespacerange([\s\S]*?)endcodespacerange/gm;
+  let m;
+  while ((m = csr.exec(cmapText))) {
+    const body = m[1];
+    const lines = body.match(/<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>/g) || [];
+    for (const ln of lines) {
+      const mm = ln.match(/<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>/);
+      if (!mm) continue;
+      bytesPerChar = Math.max(bytesPerChar, Math.ceil(mm[1].length / 2));
+    }
+  }
+  const map = Object.create(null);
+
+  function hexToCode(hex){ return parseInt(hex,16); }
+  function hexToUnicodeString(hex){
+    // interpret as big-endian UTF-16 code units
+    const bytes = hex.match(/../g)?.map(h=>parseInt(h,16)) || [];
+    let s = '';
+    for (let i=0;i<bytes.length;i+=2){
+      const u = ((bytes[i]<<8) | (bytes[i+1]||0)) >>> 0;
+      if (u) s += String.fromCharCode(u);
+    }
+    return s;
+  }
+
+  // bfchar: explicit mappings
+  const bfchar = /beginbfchar([\s\S]*?)endbfchar/gm;
+  while ((m = bfchar.exec(cmapText))) {
+    const lines = m[1].split(/\r?\n/);
+    for (const ln of lines) {
+      const mm = ln.match(/<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>/);
+      if (!mm) continue;
+      const src = hexToCode(mm[1]);
+      map[src] = hexToUnicodeString(mm[2]);
+    }
+  }
+
+  // bfrange: ranges or explicit lists
+  const bfrange = /beginbfrange([\s\S]*?)endbfrange/gm;
+  while ((m = bfrange.exec(cmapText))) {
+    const lines = m[1].split(/\r?\n/);
+    for (const ln of lines) {
+      // form: <start> <end> <dstStart>
+      let mm = ln.match(/<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>/);
+      if (mm) {
+        const s = hexToCode(mm[1]), e = hexToCode(mm[2]);
+        const dst0Hex = mm[3];
+        // sequential mapping only when dst0 looks like one UTF-16 unit
+        if (dst0Hex.length === 4) {
+          const dst0 = hexToCode(dst0Hex);
+          for (let c=s;c<=e;c++) map[c] = String.fromCharCode(dst0 + (c - s));
+        } else {
+          // fallback: treat like bfchar for start only
+          map[s] = hexToUnicodeString(dst0Hex);
+        }
+        continue;
+      }
+      // form: <start> <end> [ <d1> <d2> ... ]
+      mm = ln.match(/<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*\[([^\]]+)\]/);
+      if (mm) {
+        const s = hexToCode(mm[1]), e = hexToCode(mm[2]);
+        const list = mm[3].match(/<([0-9A-Fa-f]+)>/g) || [];
+        for (let i=0;i<list.length && s+i<=e;i++){
+          const h = list[i].slice(1,-1);
+          map[s+i] = hexToUnicodeString(h);
+        }
+      }
+    }
+  }
+
+  return { map, bytesPerChar };
+}
+
+const installedFonts = new Set();
+function installEmbeddedFontCss(fontFamily, ttfLatin1){
+  if (!ttfLatin1 || installedFonts.has(fontFamily)) return;
+  installedFonts.add(fontFamily);
+  const css = `@font-face{
+    font-family:'${cssEscape(fontFamily)}';
+    src:url(data:font/ttf;base64,${base64FromLatin1(ttfLatin1)}) format('truetype');
+    font-weight:normal;font-style:normal;font-display:swap;}`;
+  let el = document.getElementById('pdf-embedded-fonts');
+  if (!el) { el = document.createElement('style'); el.id = 'pdf-embedded-fonts'; document.head.appendChild(el); }
+  el.appendChild(document.createTextNode(css));
+}
+
+// --- Replace your cacheFontsFromResources with this ---
+
+async function cacheFontsFromResources(resourcesDict, pageKey) {
+  debugInfo.push(`[FontCache] Raw /Resources dictionary for page ${pageKey}: ${resourcesDict}`);
+
+  // Accept: <<.../Font ...>>, <...R>, [ ... R ], OR plain " /Font 4 0 R "
+  const fontMatch = resourcesDict.match(
+    /\/Font\s*(<<[\s\S]*?>>|<[^>]*\d+\s+\d+\s+R[^>]*>|\[[^\]]*?\]|\d+\s+\d+\s+R)/
+  );
+  if (!fontMatch) {
+    debugInfo.push(`[FontCache] No /Font dictionary found in /Resources for page ${pageKey}`);
+    return;
+  }
+
+  let fontContainer = fontMatch[1] || '';
+
+  // If /Font is an indirect ref, load its dict
+  const refOnly = fontContainer.replace(/[<>\[\]]/g, ' ').match(/(^|\s)(\d+)\s+(\d+)\s+R(?=\s|$)/);
+  if (refOnly) {
+    const objNum = +refOnly[2], genNum = +refOnly[3];
+    await processObjStmIfNeeded(objNum, genNum);
+    const fontDictObj = objects.get(`${objNum} ${genNum}`);
+    if (!fontDictObj) {
+      debugInfo.push(`[FontCache] /Font ref ${objNum} ${genNum} not found for page ${pageKey}`);
+      return;
+    }
+    fontContainer = fontDictObj.dict || '';
+    debugInfo.push(`[FontCache] /Font is indirect -> using dict of ${objNum} ${genNum}: ${fontContainer}`);
+  }
+
+  // Entries can be inline dict OR <…R> OR plain "4 0 R"
+  const entryRe =
+    /\/([A-Za-z0-9\-\+]+)\s*(?:(<<[\s\S]*?>>)|(<[^>]*(\d+)\s+(\d+)\s+R[^>]*>)|((\d+)\s+(\d+)\s+R))/g;
+
+  let m, found = 0;
+  while ((m = entryRe.exec(fontContainer))) {
+    const fontKey = m[1];
+    const inlineBody = m[2];
+    const refNum = m[4] ? +m[4] : (m[7] ? +m[7] : null);
+    const refGen = m[5] ? +m[5] : (m[8] ? +m[8] : null);
+
+    let fontBody = '';
+    if (inlineBody) {
+      fontBody = inlineBody;
+    } else if (refNum !== null) {
+      await processObjStmIfNeeded(refNum, refGen);
+      const fObj = objects.get(`${refNum} ${refGen}`);
+      if (!fObj) {
+        debugInfo.push(`[FontCache] Font object ${refNum} ${refGen} not found for ${fontKey} in page ${pageKey}`);
+        continue;
+      }
+      fontBody = fObj.dict || '';
+    } else {
+      continue;
+    }
+    found++;
+
+    // Grab FontDescriptor + embedded FontFile if any
+    let ttfLatin1 = null;
+    const descRef = fontBody.match(/\/FontDescriptor\s+(\d+)\s+(\d+)\s+R/);
+    if (descRef) {
+      await processObjStmIfNeeded(+descRef[1], +descRef[2]);
+      const descObj = objects.get(`${+descRef[1]} ${+descRef[2]}`);
+      if (descObj) {
+        const ffRef = (descObj.dict || '').match(/\/FontFile[123]?\s+(\d+)\s+(\d+)\s+R/);
+        if (ffRef) {
+          await processObjStmIfNeeded(+ffRef[1], +ffRef[2]);
+          const fileObj = objects.get(`${+ffRef[1]} ${+ffRef[2]}`);
+          if (fileObj && !fileObj.processed) {
+            await extractAndDecodeStream(fileObj, fileBytes, fileText);
+            fileObj.processed = true;
+          }
+          if (fileObj?.decoded) {
+            ttfLatin1 = fileObj.decoded; // latin1 string of binary
+            debugInfo.push(`[FontCache] Embedded font extracted for ${fontKey}, ${ttfLatin1.length} bytes`);
+          }
+        }
+      }
+    }
+
+    // Parse ToUnicode CMap if present
+    let toUnicode = null;
+    const toUniRef = fontBody.match(/\/ToUnicode\s+(\d+)\s+(\d+)\s+R/);
+    if (toUniRef) {
+      await processObjStmIfNeeded(+toUniRef[1], +toUniRef[2]);
+      const toObj = objects.get(`${+toUniRef[1]} ${+toUniRef[2]}`);
+      if (toObj && !toObj.processed) {
+        await extractAndDecodeStream(toObj, fileBytes, fileText);
+        toObj.processed = true;
+      }
+      if (toObj?.decoded) {
+        toUnicode = parseToUnicodeCMap(toObj.decoded);
+      }
+    }
+
+    const subtype = (fontBody.match(/\/Subtype\s*\/(\w+)/) || [])[1] || 'Unknown';
+    const baseName = (fontBody.match(/\/BaseFont\s*\/([^\s/]+)/) || [])[1] || fontKey;
+    const encoding = (fontBody.match(/\/Encoding\s*\/([^\s/]+)/) || [])[1] || 'StandardEncoding';
+
+    // Install embedded font face so glyph shapes render correctly
+    const cssFamily = baseName.replace(/^[A-Z]{6}\+/, ''); // strip subset prefix
+    if (ttfLatin1) installEmbeddedFontCss(cssFamily, ttfLatin1);
+
+    fontCache.set(fontKey, {
+      type: subtype,
+      name: baseName,
+      encoding,
+      ttf: ttfLatin1,
+      extension: ttfLatin1 ? 'ttf' : null,
+      // ToUnicode mapping for text decoding; renderer will prefer this
+      toUnicode
+    });
+  }
+
+  if (!found) {
+    debugInfo.push(`[FontCache] /Font dict parsed but no entries found for page ${pageKey}`);
+  } else {
+    debugInfo.push(`[FontCache] Parsed ${found} font entries for page ${pageKey}`);
+  }
+}
+
+  async function discoverRootAndXrefs(txt, bytes) {
+    rootKey = '';
+    const startxrefMatch = txt.match(/startxref\s*(\d+)\s*%%EOF/);
+    if (startxrefMatch) {
+      const startxrefOffset = parseInt(startxrefMatch[1], 10);
+      const xrefSection = txt.substring(startxrefOffset);
+      const objMatch = xrefSection.match(/^(\d+)\s+(\d+)\s+obj/);
+      if (objMatch) {
+        const objKey = `${objMatch[1]} ${objMatch[2]}`;
+        const xrefStreamObj = objects.get(objKey);
+        if (xrefStreamObj && /\/Type\s*\/XRef\b/.test(xrefStreamObj.dict || '')) {
+          await extractAndDecodeStream(xrefStreamObj, bytes, txt);
+          const rootMatch = xrefStreamObj.dict.match(/\/Root\s+(\d+)\s+(\d+)\s+R/);
+          if (rootMatch) rootKey = `${rootMatch[1]} ${rootMatch[2]}`;
+          parseXrefStream(xrefStreamObj);
+        }
+      } else if (xrefSection.startsWith('xref')) {
+        const trailerMatch = xrefSection.match(/trailer[\s\r\n]*<<([\s\S]*?)>>/);
+        if (trailerMatch) {
+          const rootMatch = trailerMatch[1].match(/\/Root\s+(\d+)\s+(\d+)\s+R/);
+          if (rootMatch) rootKey = `${rootMatch[1]} ${rootMatch[2]}`;
+          parseTraditionalXref(xrefSection);
+        }
+      }
+    }
+    if (!rootKey) {
+      const tr = /trailer[\s\r\n]*<<([\s\S]*?)>>/g;
+      let m, lastTrailer = '';
+      while (m = tr.exec(txt)) lastTrailer = m[1];
+      if (lastTrailer) {
+        const m2 = lastTrailer.match(/\/Root\s+(\d+)\s+(\d+)\s+R/);
+        if (m2) rootKey = `${m2[1]} ${m2[2]}`;
+      }
+    }
+    if (rootKey) {
+      const [num, gen] = rootKey.split(' ').map(Number);
+      await processObjStmIfNeeded(num, gen);
+    }
+  }
+
+  async function collectPagesFromRoot(key, visited = new Set()) {
+    if (visited.has(key)) return;
+    visited.add(key);
+    const [num, gen] = key.split(' ').map(Number);
+    await processObjStmIfNeeded(num, gen);
+    const obj = objects.get(key);
+    if (!obj) {
+      console.warn(`Object ${key} not found during traversal`);
+      debugInfo.push(`[Traversal] Object ${key} not found during page tree traversal`);
+      return;
+    }
+    const typeMatch = (obj.dict || '').match(/\/Type\s*\/(\w+)/);
+    const type = typeMatch ? typeMatch[1] : null;
+
+    if (type === 'Catalog') {
+      const pagesRefMatch = (obj.dict || '').match(/\/Pages\s+(\d+)\s+(\d+)\s+R/);
+      if (pagesRefMatch) {
+        const pagesKey = `${pagesRefMatch[1]} ${pagesRefMatch[2]}`;
+        debugInfo.push(`[Traversal] /Catalog ${key} -> /Pages ${pagesKey}`);
+        await processObjStmIfNeeded(+pagesRefMatch[1], +pagesRefMatch[2]);
+        await collectPagesFromRoot(pagesKey, visited);
+      } else {
+        debugInfo.push(`[Traversal] /Catalog ${key} has no /Pages reference`);
+      }
+      return;
+    }
+
+    if (type === 'Page') {
+      pages.push(obj);
+      const resourcesMatch = (obj.dict || '').match(/\/Resources\s*(?:(\d+)\s+(\d+)\s+R|<<([\s\S]*?)>>)/);
+      if (resourcesMatch) {
+        if (resourcesMatch[1] && resourcesMatch[2]) {
+          const resourcesKey = `${resourcesMatch[1]} ${resourcesMatch[2]}`;
+          await processObjStmIfNeeded(+resourcesMatch[1], +resourcesMatch[2]);
+          const resourcesObj = objects.get(resourcesKey);
+          if (resourcesObj) {
+            await cacheFontsFromResources(resourcesObj.dict || '', key);
+          } else {
+            debugInfo.push(`[FontCache] Resources object ${resourcesKey} not found for page ${key}`);
+          }
+        } else if (resourcesMatch[3]) {
+          await cacheFontsFromResources(resourcesMatch[0], key);
+        }
+      } else {
+        debugInfo.push(`[FontCache] No /Resources dictionary found for page ${key}`);
+      }
+    } else if (type === 'Pages') {
+      const kidsMatch = (obj.dict || '').match(/\/Kids\s*\[([\s\S]*?)\]/);
+      if (kidsMatch) {
+        const kids = kidsMatch[1].match(/(\d+)\s+(\d+)\s+R/g) || [];
+        for (const kidRef of kids) {
+          const kidMatch = kidRef.match(/(\d+)\s+(\d+)\s+R/);
+          if (kidMatch) {
+            const kidKey = `${kidMatch[1]} ${kidMatch[2]}`;
+            const [kidNum, kidGen] = kidKey.split(' ').map(Number);
+            await processObjStmIfNeeded(kidNum, kidGen);
+            await collectPagesFromRoot(kidKey, visited);
+          }
+        }
+      } else {
+        debugInfo.push(`[Traversal] /Pages ${key} has no /Kids array`);
+      }
+    } else {
+      debugInfo.push(`[Traversal] Object ${key} Type=${type || 'Unknown'} ignored in page-tree traversal`);
+    }
+  }
+
+  async function collectPages() {
+    for (const o of objects.values()) {
+      if (/\/Type\s*\/Page\b/.test(o.dict || '')) {
+        pages.push(o);
+        const resourcesMatch = (o.dict || '').match(/\/Resources\s*(?:(\d+)\s+(\d+)\s+R|<<([\s\S]*?)>>)/);
+        if (resourcesMatch) {
+          if (resourcesMatch[1] && resourcesMatch[2]) {
+            const resourcesKey = `${resourcesMatch[1]} ${resourcesMatch[2]}`;
+            await processObjStmIfNeeded(+resourcesMatch[1], +resourcesMatch[2]);
+            const resourcesObj = objects.get(resourcesKey);
+            if (resourcesObj) {
+              await cacheFontsFromResources(resourcesObj.dict || '', `${o.num} ${o.gen}`);
+            } else {
+              debugInfo.push(`[FontCache] Resources object ${resourcesKey} not found for page ${o.num} ${o.gen}`);
+            }
+          } else if (resourcesMatch[3]) {
+            await cacheFontsFromResources(resourcesMatch[0], `${o.num} ${o.gen}`);
+          }
+        } else {
+          debugInfo.push(`[FontCache] No /Resources dictionary found for page ${o.num} ${o.gen}`);
+        }
+      }
+    }
+  }
+
+  async function getPageContent(obj) {
+    const contentsMatch = (obj.dict || '').match( /\/Contents\s*(?:(\d+)\s+(\d+)\s+R|\[([\s\S]*?)\])/ );
+    let content = '';
+    if (contentsMatch) {
+      if (contentsMatch[1] && contentsMatch[2]) {
+        const contentKey = `${contentsMatch[1]} ${contentsMatch[2]}`;
+        await processObjStmIfNeeded(+contentsMatch[1], +contentsMatch[2]);
+        const contentObj = objects.get(contentKey);
+        if (contentObj && !contentObj.processed) {
+          await extractAndDecodeStream(contentObj, fileBytes, fileText);
+          contentObj.processed = true;
+        }
+        if (contentObj && contentObj.decoded) {
+          content = contentObj.decoded.trim();
+        }
+      } else if (contentsMatch[3]) {
+        const refs = contentsMatch[3].match(/(\d+)\s+(\d+)\s+R/g) || [];
+        for (const ref of refs) {
+          const refMatch = ref.match(/(\d+)\s+(\d+)\s+R/);
+          if (refMatch) {
+            const contentKey = `${refMatch[1]} ${refMatch[2]}`;
+            await processObjStmIfNeeded(+refMatch[1], +refMatch[2]);
+            const contentObj = objects.get(contentKey);
+            if (contentObj && !contentObj.processed) {
+              await extractAndDecodeStream(contentObj, fileBytes, fileText);
+              contentObj.processed = true;
+            }
+            if (contentObj && contentObj.decoded) {
+              content += contentObj.decoded.trim() + '\n';
+            }
+          }
+        }
+      }
+    }
+    return content;
+  }
+
+// 1) Replace the old linkify with this:
+function linkifyToHtml(s) {
+  // Step A: mark refs with placeholders (no lookbehind — Safari-safe)
+  // Matches at start OR when previous char isn't a digit
+  const withMarks = s.replace(/(^|[^\d])(\d+\s+\d+\s+R)\b/g, (m, pre, ref) => {
+    const parts = ref.split(/\s+/); // ["3","0","R"]
+    return `${pre}@@REF:${parts[0]}:${parts[1]}@@`;
+  });
+
+  // Step B: escape everything to show raw << … >>, names, etc.
+  const safe = withMarks
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+
+  // Step C: turn placeholders back into real anchors
+  return safe.replace(/@@REF:(\d+):(\d+)@@/g, (m, n, g) =>
+    `<a class="ref" data-obj="${n} ${g}" title="Click to view object ${n} ${g}">${n} ${g} R</a>`
+  );
+}
+
+// --- full show() ---
+async function show(key) {
+  const [num, gen] = key.split(' ').map(Number);
+  await processObjStmIfNeeded(num, gen);
+
+  const o = objects.get(key);
+  const $out = document.getElementById('out');
+  const outCont = document.getElementById('outputContainer');
+
+  if (!o) {
+    $out.textContent = `Object ${key} not found.`;
+    outCont.innerHTML = '';
+    return;
+  }
+
+  // Lazy-decode stream if present
+  if (o.raw.indexOf('stream') !== -1 && !o.processed) {
+    await extractAndDecodeStream(o, fileBytes, fileText);
+    o.processed = true;
+  }
+
+  // Use dict only if it looks like a proper "<< >>" dict; else fall back to raw
+  const hasValidDict = !!(o.dict && /<<[\s\S]*>>/.test(o.dict));
+  const dictOrRaw = hasValidDict ? o.dict : (o.raw || '');
+
+  // Header + linkified dictionary/raw (escaped so << and >> display correctly)
+  let header = `Object ${key} obj\n`;
+  let body = linkifyToHtml(dictOrRaw);
+
+  // If this is a /Page, show fonts, content stream, and render it
+  const isPage = /\/Type\s*\/Page\b/.test(o.dict || o.raw || '');
+  let extra = '';
+
+  if (isPage) {
+    // Fonts section
+    extra += `\n\n----- Fonts for Page ${key} -----\n`;
+    if (fontCache.size === 0) {
+      extra += 'No fonts cached for this page.\n';
+    } else {
+      for (const [fontKey, f] of fontCache) {
+        let line = `${fontKey}: Type=${f.type}, Name=${f.name}, Encoding=${f.encoding}`;
+        if (f.ttf) line += `, TTF Data=${f.ttf.byteLength} bytes, Extension=${f.extension}`;
+        extra += line + '\n';
+      }
+    }
+
+    // Content stream (also linkified + escaped for display)
+    const content = await getPageContent(o);
+    if (content) {
+      extra += `\n\n----- Content Stream -----\n` + linkifyToHtml(content);
+
+      // Compute page size and render
+      const mediaBoxMatch = (o.dict || o.raw || '').match(
+        /\/MediaBox\s*\[\s*(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s+(\d+\.?\d*)\s*\]/
+      );
+      const mediaBox = mediaBoxMatch ? mediaBoxMatch.slice(1, 5).map(Number) : [0, 0, 612, 792];
+      const width  = mediaBox[2] - mediaBox[0];
+      const height = mediaBox[3] - mediaBox[1];
+
+      outCont.style.width = `${width}px`;
+      outCont.style.height = `${height}px`;
+      outCont.innerHTML = '';
+
+      if (typeof window.renderPage === 'function') {
+        try {
+          await window.renderPage(
+            { content, fontCache, width, height, xrefEntries, objects, fileBytes },
+            outCont,
+            document.getElementById('viewportWrapper')
+          );
+        } catch (err) {
+          console.error('renderPage error:', err);
+        }
+      }
+    } else {
+      outCont.innerHTML = '';
+    }
+  } else {
+    outCont.innerHTML = '';
+  }
+
+  // Write to the inspector
+  $out.innerHTML = `<pre>${header}${body}${extra}</pre>`;
+}
+
+
+
+  function showDebugInfo() {
+    let html = '<div class="debug-info"><h3>Debug Information</h3>';
+    html += debugInfo.map(info => `<div>${info.replace(/</g, '&lt;')}</div>`).join('');
+    html += '<h4>Objects Summary</h4>';
+    const sortedObjects = [...objects.entries()].sort(([a], [b]) => (+a.split(' ')[0]) - (+b.split(' ')[0]));
+    for (const [key, obj] of sortedObjects) {
+      const hasStream = obj.stream ? ' [stream]' : '';
+      const hasDecoded = obj.decoded ? ' [decoded]' : '';
+      const hasError = obj.streamError ? ' [ERROR]' : '';
+      const type = obj.dict ? (obj.dict.match(/\/Type\s*\/(\w+)/) || ['', 'Unknown'])[1] : 'No dict';
+      html += `<div>Obj ${key}: Type=${type}${hasStream}${hasDecoded}${hasError}</div>`;
+    }
+    html += '<h4>XRef Entries</h4>';
+    const objNums = Array.from(xrefEntries.keys()).sort((a, b) => a - b);
+    for (const objNum of objNums) {
+      const entry = xrefEntries.get(objNum);
+      let desc = `Obj ${objNum}: `;
+      if (entry.type === 'free') desc += `free (gen ${entry.gen})`;
+      else if (entry.type === 'in-use') desc += `used at offset ${entry.offset} (gen ${entry.gen})`;
+      else if (entry.type === 'compressed') desc += `compressed in ObjStm ${entry.objStm} at index ${entry.index}`;
+      html += `<div>${desc}</div>`;
+    }
+    html += '<h4>Font Cache</h4>';
+    if (fontCache.size === 0) {
+      html += '<div>No fonts cached.</div>';
+    } else {
+      for (const [fontKey, fontData] of fontCache) {
+        let desc = `${fontKey}: Type=${fontData.type}, Name=${fontData.name}, Encoding=${fontData.encoding}`;
+        if (fontData.ttf) {
+          desc += `, TTF Data=${fontData.ttf.byteLength} bytes, Extension=${fontData.extension}`;
+        }
+        html += `<div>${desc}</div>`;
+      }
+    }
+    html += '</div>';
+    $out.innerHTML = html;
+  }
+
+  $file.addEventListener('change', async e => {
+    reset();
+    const f = e.target.files[0]; if (!f) return;
+    $out.textContent = 'Parsing…';
+    const buf = await f.arrayBuffer();
+    fileBytes = new Uint8Array(buf);
+    fileText = new TextDecoder('latin1').decode(buf);
+    console.clear();
+    mark('Start PDF Parse');
+    console.log("--- Starting PDF Parse ---");
+    debugInfo = [`=== PDF Parse Debug Info ===`, `File size: ${buf.byteLength} bytes`];
+    collectIndirectObjects(fileText);
+    
+    if (typeof window.__flushPendingPdfObjects === 'function') { window.__flushPendingPdfObjects(store); }
+console.log(`[Step 1] Found ${objects.size} classic objects.`);
+    debugInfo.push(`[Step 1] Found ${objects.size} classic objects.`);
+    await discoverRootAndXrefs(fileText, fileBytes);
+    mark('Discovered root + xrefs');
+    console.log(`[Step 2] Parsed XRef, root key: ${rootKey || 'none'}.`);
+    debugInfo.push(`[Step 2] Parsed XRef, root key: ${rootKey || 'none'}`);
+    if (rootKey && objects.has(rootKey)) {
+      console.log("[Step 3] Traversing page tree from /Root...");
+      await collectPagesFromRoot(rootKey);
+      console.log(`[Step 3] Found ${pages.length} pages via tree traversal.`);
+      mark('Collected pages via root traversal');
+      debugInfo.push(`[Step 3] Found ${pages.length} pages via tree traversal`);
+    } else if (rootKey) {
+      console.warn("[Step 3] Root object identified but not found in objects.");
+      debugInfo.push(`[Step 3] WARNING: Root ${rootKey} identified but not found`);
+    }
+    if (!pages.length) {
+      console.warn('[Step 4] No pages via /Root tree. Fallback scanning /Type /Page.');
+      await collectPages();
+      console.log(`[Step 4] Found ${pages.length} pages via fallback scan.`);
+      mark('Collected pages via fallback scan');
+      debugInfo.push(`[Step 4] Found ${pages.length} pages via fallback scan`);
+    }
+    const isEncrypted = checkEncryption(fileText);
+    if (isEncrypted) {
+      debugInfo.push(`[Step 5] WARNING: PDF appears to be encrypted - streams cannot be decoded`);
+      console.warn("[Step 5] PDF is encrypted");
+      $out.textContent = 'PDF is encrypted. Stream decoding is not supported.';
+      return;
+    }
+    console.log("--- Parse Complete ---");
+    showPerfSummary();
+    buildUI();
+  });
+
+  $pages.addEventListener('change', async () => {
+    const id = $pages.value; if (id) await show(id);
+  });
+
+  $rootBtn.addEventListener('click', async () => {
+    if (rootKey) await show(rootKey);
+  });
+
+  $debugBtn.addEventListener('click', () => {
+    showDebugInfo();
+  });
+
+  document.getElementById('out').addEventListener('click', async e => {
+    const anchor = e.target.closest('a.ref');
+    if (anchor && anchor.dataset.obj) {
+      await show(anchor.dataset.obj);
+    }
+  });
+
+  function buildUI() {
+    if (pages.length) {
+      $pages.disabled = false;
+      pages.sort((a, b) => a.num - b.num);
+      pages.forEach((p, i) => {
+        const opt = document.createElement('option');
+        opt.value = `${p.num} ${p.gen}`;
+        opt.textContent = `Page ${i + 1} (obj ${p.num} ${p.gen})`;
+        $pages.appendChild(opt);
+      });
+    } else {
+      $pages.disabled = true;
+    }
+    $rootBtn.disabled = !rootKey;
+    (async () => {
+      if (pages.length > 0) {
+        await show(`${pages[0].num} ${pages[0].gen}`);
+        $pages.value = `${pages[0].num} ${pages[0].gen}`;
+      } else if (rootKey && objects.has(rootKey)) {
+        await show(rootKey);
+      } else if (rootKey) {
+        $out.textContent = `Root object ${rootKey} was identified, but its content was not found. The PDF might be corrupted or unsupported.`;
+      } else {
+        $out.textContent = 'No /Page or /Root object could be found. The PDF may be encrypted or corrupted.';
+      }
+    })();
+  }
+}
+
+window.addEventListener('load', initPDFExplorer);
+</script>
+<script src="text-vector.js"></script>
+<script src="image.js"></script>
+
+<!-- Unified and Consolidated PDF Viewport and Zoom Control Script -->
+<script>
+(() => {
+  const KEY = '__pdfViewportControllerSingleton__';
+  if (window[KEY]) return;
+  window[KEY] = true;
+
+  const ZS = {
+    mode: 'fit-page',
+    zoom: 1,
+    min: 0.05,
+    max: 20,
+    padding: 16,
+  };
+
+  function clamp(n, a, b){ return Math.max(a, Math.min(b, n)); }
+
+  function detectPageSize(out){
+    let w = parseFloat(out.style.width);
+    let h = parseFloat(out.style.height);
+    const c = out.firstElementChild;
+    if ((!w || !h) && c) {
+      if (c.tagName === 'CANVAS' && c.width && c.height) { w = w || c.width; h = h || c.height; }
+      if (c.tagName === 'SVG') {
+        const vb = c.getAttribute('viewBox');
+        if (vb) {
+          const parts = vb.trim().split(/[ ,]+/).map(Number);
+          if (parts.length === 4) { w = w || parts[2]; h = h || parts[3]; }
+        }
+        const sw = parseFloat(c.getAttribute('width'));
+        const sh = parseFloat(c.getAttribute('height'));
+        if (!w && sw) w = sw;
+        if (!h && sh) h = sh;
+      }
+      if (c.tagName === 'IMG' && c.naturalWidth && c.naturalHeight) { w = w || c.naturalWidth; h = h || c.naturalHeight; }
+      if ((!w || !h) && c.offsetWidth && c.offsetHeight) { w = w || c.offsetWidth; h = h || c.offsetHeight; }
+    }
+    if (!w || !h) {
+      if (out.scrollWidth && out.scrollHeight) { w = w || out.scrollWidth; h = h || out.scrollHeight; }
+    }
+    return { w: w || 1024, h: h || 1024 };
+  }
+
+  window.fitPDFViewport = function fitPDFViewport() {
+    const wrap = document.getElementById('viewportWrapper');
+    const out = document.getElementById('outputContainer');
+    if (!wrap || !out) return;
+
+    const { w: pageW, h: pageH } = detectPageSize(out);
+    const vw = wrap.clientWidth - ZS.padding * 2;
+    const vh = wrap.clientHeight - ZS.padding * 2;
+
+    let S;
+    if (ZS.mode === 'fit-width')       S = vw / pageW;
+    else if (ZS.mode === 'fit-height') S = vh / pageH;
+    else if (ZS.mode === 'custom')     S = ZS.zoom;
+    else                               S = Math.min(vw / pageW, vh / pageH);
+
+    S = clamp(S, ZS.min, ZS.max);
+
+    const tx = Math.floor((wrap.clientWidth - pageW * S) / 2);
+    const ty = Math.floor((wrap.clientHeight - pageH * S) / 2);
+
+    out.style.transformOrigin = 'left top';
+    out.style.transform = `translate(${tx}px, ${ty}px) scale(${S})`;
+  };
+
+  window.fitPage    = () => { ZS.mode = 'fit-page';   window.fitPDFViewport(); };
+  window.fitWidth   = () => { ZS.mode = 'fit-width';  window.fitPDFViewport(); };
+  window.fitHeight  = () => { ZS.mode = 'fit-height'; window.fitPDFViewport(); };
+  window.zoomTo     = (v) => { ZS.mode = 'custom'; ZS.zoom = clamp(Number(v)||1, ZS.min, ZS.max); window.fitPDFViewport(); };
+  window.getPDFZoom = () => ({ mode: ZS.mode, value: ZS.mode === 'custom' ? ZS.zoom : null });
+
+  function burstRefit() {
+    // Reduce frequency of viewport updates for better performance
+    if (burstRefit.pending) return;
+    burstRefit.pending = true;
+    
+    requestAnimationFrame(() => {
+      window.fitPDFViewport();
+      burstRefit.pending = false;
+    });
+  }
+
+  window.onPDFFileLoaded = function() {
+    window.fitPage();
+    burstRefit();
+  };
+
+  const originalRenderPage = window.renderPage;
+    window.renderPage = async function(...args) {
+        if (typeof window.spanStart === 'function') {
+            window.spanStart('Render page');
+        }
+        if (typeof originalRenderPage === 'function') {
+            await originalRenderPage.apply(this, args);
+        }
+        let _renderMs = 0;
+        if (typeof window.spanEnd === 'function') {
+            _renderMs = window.spanEnd('Render page');
+        }
+        burstRefit();
+    };
+
+  const outEl = document.getElementById('outputContainer');
+  if (outEl && 'MutationObserver' in window) {
+    const mo = new MutationObserver(() => {
+      const z = window.getPDFZoom();
+      if (z.mode !== 'custom') burstRefit();
+    });
+    mo.observe(outEl, { childList: true, subtree: true, attributes: true });
+  }
+
+  const wrapEl = document.getElementById('viewportWrapper');
+  if (wrapEl && 'ResizeObserver' in window) {
+    const ro = new ResizeObserver(burstRefit);
+    ro.observe(wrapEl);
+  } else {
+    window.addEventListener('resize', burstRefit);
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', window.onPDFFileLoaded);
+  } else {
+    window.onPDFFileLoaded();
+  }
+})();
+
+</script>
+</body>
+</html>
